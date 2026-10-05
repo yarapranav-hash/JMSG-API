@@ -86,6 +86,7 @@ INSERT dbo.PushConfig_Monthly (ParamName, SortOrder, SourceType, SourceValue, Da
 ('diff_amt',              340, 'CONST',    '0', NULL, NULL, NULL),
 ('diff_amt_bldt',         350, 'CONST',    '',  NULL, NULL, N'empty = element not sent'),
 ('diff_amt_sentdt',       360, 'CONST',    '',  NULL, NULL, N'empty = element not sent'),
+('scno',                  365, 'SERVICE',  'ServiceNoCompact', NULL, NULL, N'Service No with spaces removed (Quote=1 set manually)'),
 ('username',              370, 'CONST',    '{SOAP_USERNAME}', NULL, NULL, NULL),
 ('password',              380, 'CONST',    '{SOAP_PASSWORD}', NULL, NULL, NULL);
 GO

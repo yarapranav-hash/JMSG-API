@@ -1,4 +1,6 @@
+using System.Collections.Concurrent;
 using System.Data;
+using System.Diagnostics;
 using System.Globalization;
 using System.Text.RegularExpressions;
 using Microsoft.Data.SqlClient;
@@ -21,9 +23,11 @@ class MonthlyPush
     readonly Dictionary<string, string> global;
     readonly Opts opts;
 
-    public MonthlyPush(SqlConnection db, HttpClient http, Dictionary<string, string> global, Opts opts)
+    readonly string connStr; // the parallel procedure calls open their own connections
+
+    public MonthlyPush(SqlConnection db, string connStr, HttpClient http, Dictionary<string, string> global, Opts opts)
     {
-        this.db = db; this.http = http; this.global = global; this.opts = opts;
+        this.db = db; this.connStr = connStr; this.http = http; this.global = global; this.opts = opts;
     }
 
     public bool Run()
@@ -37,40 +41,63 @@ class MonthlyPush
         if (prms.Count == 0) { Log("setMonthly: PushConfig_Monthly is empty - skipped"); return true; }
 
         Log($"setMonthly: push date {pushDate:yyyy-MM-dd}, opening readings from {oldDate:yyyy-MM-dd}");
-        var newR = CallProc(pushDate);
-        var oldR = CallProc(oldDate);
+
+        // every procedure call we may need, run in parallel (each on its own connection):
+        //  - push date (closing) and opening date, plus the following OPENING_FORWARD_DAYS days for services with no opening reading
+        //  - PROC_PREVEND params (rmd_kva, rmd_kwh): last day of the month before the push date, plus up to MD_LOOKBACK_DAYS earlier days
+        var forward = int.Parse(global.GetValueOrDefault("OPENING_FORWARD_DAYS", "1"));
+        var lookback = int.Parse(global.GetValueOrDefault("MD_LOOKBACK_DAYS", "7"));
+        var monthStart = pushDate.AddDays(-pushDate.Day).AddDays(1).AddMonths(-1); // first day of the previous month
+        var usesMd = prms.Any(p => p.Type == "PROC_PREVEND");
+        var forwardDates = Enumerable.Range(1, forward).Select(i => oldDate.AddDays(i)).ToList();
+        var mdDates = usesMd
+            ? Enumerable.Range(0, lookback + 1).Select(i => pushDate.AddDays(-pushDate.Day - i)).Where(d => d >= monthStart).ToList()
+            : new List<DateTime>();
+        var results = CallMany(new[] { pushDate, oldDate }.Concat(forwardDates).Concat(mdDates).Distinct().ToList());
+
+        var newR = results[pushDate];
+        var oldR = new Dictionary<string, Reading>(results[oldDate], StringComparer.Ordinal);
         Log($"setMonthly: procedure returned {newR.Count} service(s) for {pushDate:yyyy-MM-dd}, {oldR.Count} for {oldDate:yyyy-MM-dd}");
 
-        // PROC_PREVEND params (rmd_kva, rmd_kwh): latest reading on the last day of the month before the push date;
-        // a service with no reading that day takes the latest reading of the previous day that has one, and so on
-        var prevEndR = new Dictionary<string, Reading>(StringComparer.Ordinal);
-        if (prms.Any(p => p.Type == "PROC_PREVEND"))
+        // opening reading: a service with no reading on the opening date takes the latest reading of the next day that has one
+        foreach (var d in forwardDates)
         {
-            var lookback = int.Parse(global.GetValueOrDefault("MD_LOOKBACK_DAYS", "7"));
-            var monthStart = pushDate.AddDays(-pushDate.Day).AddDays(1).AddMonths(-1); // first day of the previous month
-            for (int back = 0; back <= lookback && prevEndR.Count < newR.Count; back++)
-            {
-                var d = pushDate.AddDays(-pushDate.Day - back);
-                if (d < monthStart) break;
-                var added = 0;
-                foreach (var (no, r) in CallProc(d))
-                    if (newR.ContainsKey(no) && prevEndR.TryAdd(no, r)) added++;
-                Log($"setMonthly: {d:yyyy-MM-dd} (MD source) gave a reading for {added} service(s); {newR.Count - prevEndR.Count} still without");
-            }
+            var added = 0;
+            foreach (var (no, r) in results[d])
+                if (newR.ContainsKey(no) && oldR.TryAdd(no, r)) added++;
+            Log($"setMonthly: {d:yyyy-MM-dd} (opening, forward) gave an opening reading for {added} more service(s)");
         }
+        Log($"setMonthly: {newR.Keys.Count(k => !oldR.ContainsKey(k))} service(s) without an opening reading");
+
+        // rmd_kva / rmd_kwh: a service with no reading on the last day of the previous month takes the latest reading of the previous day that has one
+        var prevEndR = new Dictionary<string, Reading>(StringComparer.Ordinal);
+        foreach (var d in mdDates)
+        {
+            var added = 0;
+            foreach (var (no, r) in results[d])
+                if (newR.ContainsKey(no) && prevEndR.TryAdd(no, r)) added++;
+            Log($"setMonthly: {d:yyyy-MM-dd} (MD source) gave a reading for {added} service(s)");
+        }
+        if (usesMd) Log($"setMonthly: {newR.Count - prevEndR.Count} service(s) without an MD reading");
 
         var services = LoadServices();
         var done = LoadDone(pushDate);
 
         var maxIncreasePct = decimal.Parse(global.GetValueOrDefault("MONTHLY_MAX_INCREASE_PCT", "120"), Inv);
+        var maxMd = decimal.Parse(global.GetValueOrDefault("MONTHLY_MAX_MD", "6"), Inv);
 
         // ---- phase 1: build everything that would be sent (nothing is sent or written to the log yet)
+        prmList = prms;
+        dataCols = LoadDataColumns();
+        if (dataCols == null) Log("setMonthly: dbo.PushData_Monthly not found - sent values will not be stored (run sql\\04_create_PushData_Monthly.sql)");
         var items = new List<Item>();
-        var skips = new List<(string ServiceNo, string? Unique, string Why, bool Done)>();
+        var skips = new List<Skipped>();
         foreach (var (serviceNo, cur) in newR.OrderBy(k => k.Key, StringComparer.Ordinal))
         {
             var isDone = done.Contains(serviceNo);
-            void Skip(string? u, string why) => skips.Add((serviceNo, u, why, isDone));
+            Dictionary<string, string?>? vals = null;
+            var info = new Info(null, null, null);
+            void Skip(string? u, string why) => skips.Add(new Skipped(serviceNo, u, why, isDone, vals, info));
 
             // ukscno is ServiceDetails.UniqueServiceNo (9 digits); the service must exist in ServiceDetails
             if (!services.TryGetValue(serviceNo, out var svc)) { Skip(null, "service not found (active) in ServiceDetails"); continue; }
@@ -78,15 +105,28 @@ class MonthlyPush
             var unique = svc.Unique!;
 
             // opening reading: only used for the sanity checks below, it is NOT sent
-            if (!oldR.TryGetValue(serviceNo, out var old)) { Skip(unique, $"no reading for {oldDate:yyyy-MM-dd} (opening)"); continue; }
+            if (!oldR.TryGetValue(serviceNo, out var old)) { Skip(unique, forward > 0 ? $"no reading for {oldDate:yyyy-MM-dd} or the next {forward} day(s) (opening)" : $"no reading for {oldDate:yyyy-MM-dd} (opening)"); continue; }
+
+            var prevEnd = prevEndR.GetValueOrDefault(serviceNo);
+            info = new Info(null, old.GetValueOrDefault(ReadDate), prevEnd?.GetValueOrDefault(ReadDate));
 
             Dictionary<string, string?> values;
-            try { values = BuildValues(prms, pushDate, cur, old, prevEndR.GetValueOrDefault(serviceNo), svc); }
+            try { values = BuildValues(prms, pushDate, cur, old, prevEnd, svc); }
             catch (Exception ex) { Skip(unique, ex.Message); continue; }
+            vals = values;
+
+            // no rmd_kva / rmd_kwh on the last day of the previous month or the allowed days before it: do not send the service
+            var noMd = prms.Where(p => p.Type == "PROC_PREVEND" && string.IsNullOrEmpty(values[p.Name])).Select(p => p.Name).ToList();
+            if (noMd.Count > 0)
+            {
+                Skip(unique, $"no {string.Join("/", noMd)} reading on {mdDates.FirstOrDefault():yyyy-MM-dd}" + (lookback > 0 ? $" or the {lookback} day(s) before" : ""));
+                continue;
+            }
 
             if (!decimal.TryParse(old.GetValueOrDefault(KwhColumn), NumberStyles.Any, Inv, out var openKwh)
                 || !decimal.TryParse(cur.GetValueOrDefault(KwhColumn), NumberStyles.Any, Inv, out var closeKwh))
             { Skip(unique, "opening or closing kWh reading missing"); continue; }
+            info = info with { OpeningKwh = openKwh };
 
             var diff = closeKwh - openKwh;
             if (diff < 0) { Skip(unique, $"closing < opening (consumed {diff:0.##}) - meter replaced/rolled over?"); continue; }
@@ -100,8 +140,14 @@ class MonthlyPush
                 continue;
             }
 
+            // maximum demand above the limit (also catches glitch readings with absurd MD values)
+            var tooHigh = new[] { "rmd_kva", "rmd_kwh" }
+                .Where(n => values.TryGetValue(n, out var s) && decimal.TryParse(s, NumberStyles.Any, Inv, out var md) && md > maxMd)
+                .Select(n => $"{n} {values[n]}").ToList();
+            if (tooHigh.Count > 0) { Skip(unique, $"{string.Join(", ", tooHigh)} > {maxMd}"); continue; }
+
             items.Add(new Item(serviceNo, unique, values,
-                Soap.Envelope(Op, prms.Select(p => (p.Name, Quoted(p, values[p.Name])))), isDone));
+                Soap.Envelope(Op, prms.Select(p => (p.Name, Quoted(p, values[p.Name])))), isDone, info));
         }
 
         var toSend = items.Where(i => !i.Done).Take(limit).ToList();
@@ -122,14 +168,14 @@ class MonthlyPush
         }
         if (toSend.Count == 0) { Log("setMonthly: nothing to push"); return true; }
 
-        // ---- phase 2: explicit approval
-        Console.WriteLine();
-        Console.WriteLine($"Please check {previewFile}");
-        Console.Write($"Type yes to push {toSend.Count} record(s) to {endpoint} (anything else cancels): ");
-        if (!string.Equals(Console.ReadLine()?.Trim(), "yes", StringComparison.OrdinalIgnoreCase))
-        { Log("setMonthly: cancelled - nothing sent, nothing written to the log"); return true; }
+        // ---- phase 2: push (the preview files above are written first and kept; use --dry-run / --csv to look without sending)
+        Log($"setMonthly: pushing {toSend.Count} record(s) to {endpoint}");
 
-        foreach (var s in skips.Where(s => !s.Done)) WriteLog(pushDate, s.ServiceNo, s.Unique, "SKIPPED", s.Why);
+        foreach (var s in skips.Where(s => !s.Done))
+        {
+            WriteLog(pushDate, s.ServiceNo, s.Unique, "SKIPPED", s.Why);
+            WriteData(pushDate, s.ServiceNo, s.Unique, "SKIPPED", s.Why, s.Values, null, s.Info);
+        }
 
         var responses = new Dictionary<string, int>(); // server message -> count
         int pushed = 0, failed = 0, consecutiveFails = 0;
@@ -137,6 +183,7 @@ class MonthlyPush
         {
             var (ok, detail) = Soap.Post(http, endpoint, Op, it.Xml);
             WriteLog(pushDate, it.ServiceNo, it.Unique, ok ? "OK" : "FAILED", detail);
+            WriteData(pushDate, it.ServiceNo, it.Unique, ok ? "OK" : "FAILED", detail, it.Values, MaskPassword(it.Xml), it.Info);
             if (ok)
             {
                 pushed++; consecutiveFails = 0;
@@ -157,7 +204,58 @@ class MonthlyPush
         return failed == 0;
     }
 
-    record Item(string ServiceNo, string Unique, Dictionary<string, string?> Values, string Xml, bool Done);
+    // readings used by the checks (not sent): opening kWh, the date the opening reading and the MD reading came from
+    record Info(decimal? OpeningKwh, string? OpeningReadDate, string? MdReadDate);
+    record Item(string ServiceNo, string Unique, Dictionary<string, string?> Values, string Xml, bool Done, Info Info);
+    record Skipped(string ServiceNo, string? Unique, string Why, bool Done, Dictionary<string, string?>? Values, Info Info);
+
+    const string ReadDate = "_ReadDate"; // added to every procedure row: the date it was requested for
+    List<Param> prmList = new();
+    HashSet<string>? dataCols; // columns of dbo.PushData_Monthly, null if the table does not exist
+
+    HashSet<string>? LoadDataColumns()
+    {
+        using var cmd = new SqlCommand("SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('dbo.PushData_Monthly')", db);
+        using var r = cmd.ExecuteReader();
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        while (r.Read()) set.Add(r.GetString(0));
+        return set.Count == 0 ? null : set;
+    }
+
+    // One row per (push date, service): every value as sent (or as it was built, for skipped services), the reply and the request XML.
+    void WriteData(DateTime pushDate, string serviceNo, string? unique, string outcome, string reply,
+        Dictionary<string, string?>? values, string? xml, Info info)
+    {
+        if (dataCols == null) return;
+        var cols = prmList.Where(p => !p.Name.Equals("password", StringComparison.OrdinalIgnoreCase) && dataCols.Contains(p.Name)).ToList();
+
+        using var cmd = new SqlCommand { Connection = db };
+        cmd.Parameters.AddWithValue("@d", pushDate.Date);
+        cmd.Parameters.AddWithValue("@n", serviceNo);
+        cmd.Parameters.AddWithValue("@u", (object?)unique ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@o", outcome);
+        cmd.Parameters.AddWithValue("@r", reply.Length > 500 ? reply[..500] : reply);
+        cmd.Parameters.AddWithValue("@ok", (object?)info.OpeningKwh ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@od", info.OpeningReadDate != null ? DateTime.Parse(info.OpeningReadDate, Inv) : DBNull.Value);
+        cmd.Parameters.AddWithValue("@md", info.MdReadDate != null ? DateTime.Parse(info.MdReadDate, Inv) : DBNull.Value);
+        cmd.Parameters.AddWithValue("@x", (object?)xml ?? DBNull.Value);
+
+        var sets = new List<string>(); var names = new List<string>(); var vars = new List<string>();
+        for (int i = 0; i < cols.Count; i++)
+        {
+            var p = cols[i];
+            var v = values != null && values.TryGetValue(p.Name, out var s) ? Quoted(p, s) : null;
+            cmd.Parameters.AddWithValue("@c" + i, (object?)v ?? DBNull.Value);
+            sets.Add($"[{p.Name}]=@c{i}"); names.Add($"[{p.Name}]"); vars.Add("@c" + i);
+        }
+        var fixedCols = "UniqueServiceNo, Outcome, Reply, OpeningKwh, OpeningReadDate, MdReadDate, RequestXml";
+        cmd.CommandText = $@"
+UPDATE dbo.PushData_Monthly SET UniqueServiceNo=@u, Outcome=@o, Reply=@r, OpeningKwh=@ok, OpeningReadDate=@od, MdReadDate=@md, RequestXml=@x, PushedOn=GETDATE(){(sets.Count > 0 ? ", " + string.Join(", ", sets) : "")}
+WHERE PushDate=@d AND ServiceNo=@n;
+IF @@ROWCOUNT=0 INSERT dbo.PushData_Monthly (PushDate, ServiceNo, {fixedCols}{(names.Count > 0 ? ", " + string.Join(", ", names) : "")})
+VALUES (@d, @n, @u, @o, @r, @ok, @od, @md, @x{(vars.Count > 0 ? ", " + string.Join(", ", vars) : "")});";
+        cmd.ExecuteNonQuery();
+    }
 
     // procedure column used for the opening/closing sanity checks (these readings are not part of the request)
     const string KwhColumn = "Meter Reading(kWh)";
@@ -167,7 +265,7 @@ class MonthlyPush
     // The preview holds only the records that will be pushed, with exactly the request parameters as columns.
     // Services already sent OK are left out of both files.
     void WritePreview(string file, List<Param> prms, List<Item> toSend,
-        List<(string ServiceNo, string? Unique, string Why, bool Done)> skips)
+        List<Skipped> skips)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(file)!);
         var rows = new List<string> { string.Join(",", prms.Select(p => Csv(p.Name))) };
@@ -200,6 +298,9 @@ class MonthlyPush
                 _ => throw new InvalidOperationException($"{p.Name}: unknown SourceType {p.Type}")
             };
         }
+
+        // the opening kWh reading is not a request parameter, but CALC rows can use it (e.g. consumed_units = closing_kwh - opening_kwh_reading)
+        v["opening_kwh_reading"] = old.GetValueOrDefault(KwhColumn);
 
         foreach (var p in prms.Where(p => p.Type == "CALC"))
         {
@@ -258,18 +359,39 @@ class MonthlyPush
         return list;
     }
 
+    // Calls the procedure for several dates at the same time, each call on its own connection (PROC_PARALLELISM at a time).
+    Dictionary<DateTime, Dictionary<string, Reading>> CallMany(List<DateTime> dates)
+    {
+        var results = new ConcurrentDictionary<DateTime, Dictionary<string, Reading>>();
+        var parallelism = Math.Max(1, int.Parse(global.GetValueOrDefault("PROC_PARALLELISM", "5")));
+        Log($"setMonthly: calling the procedure for {dates.Count} date(s), {parallelism} at a time: {string.Join(", ", dates.Select(d => d.ToString("MM-dd")))}");
+        var total = Stopwatch.StartNew();
+        Parallel.ForEach(dates, new ParallelOptions { MaxDegreeOfParallelism = parallelism }, d =>
+        {
+            var sw = Stopwatch.StartNew();
+            Log($"setMonthly: {d:yyyy-MM-dd} - procedure call started");
+            using var conn = new SqlConnection(connStr);
+            conn.Open();
+            var r = CallProc(d, conn);
+            results[d] = r;
+            Log($"setMonthly: {d:yyyy-MM-dd} - procedure returned {r.Count} service(s) in {sw.Elapsed.TotalSeconds:0} s");
+        });
+        Log($"setMonthly: all procedure calls done in {total.Elapsed.TotalSeconds:0} s");
+        return results.ToDictionary(k => k.Key, k => k.Value);
+    }
+
     // One row per Service No (the procedure already keeps only the latest reading per service).
-    Dictionary<string, Reading> CallProc(DateTime date)
+    static Dictionary<string, Reading> CallProc(DateTime date, SqlConnection conn)
     {
         var result = new Dictionary<string, Reading>(StringComparer.Ordinal);
-        using var cmd = new SqlCommand(Proc, db) { CommandType = CommandType.StoredProcedure, CommandTimeout = 1200 };
+        using var cmd = new SqlCommand(Proc, conn) { CommandType = CommandType.StoredProcedure, CommandTimeout = 1200 };
         cmd.Parameters.AddWithValue("@Date", date.ToString("yyyy-MM-dd", Inv));
         cmd.Parameters.AddWithValue("@DC", DBNull.Value);
         cmd.Parameters.AddWithValue("@stmt", "ALL");
         using var r = cmd.ExecuteReader();
         while (r.Read())
         {
-            var row = new Reading();
+            var row = new Reading { [ReadDate] = date.ToString("yyyy-MM-dd", Inv) };
             for (int i = 0; i < r.FieldCount; i++)
                 row[r.GetName(i)] = r.IsDBNull(i) ? null : Convert.ToString(r.GetValue(i), Inv);
             var no = row.GetValueOrDefault("Service No")?.Trim();

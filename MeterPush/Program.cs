@@ -32,7 +32,7 @@ using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(int.Parse(globa
 
 var failed = false;
 if (opts.Op is "both" or "hourly" && !RunHourly()) failed = true;
-if (opts.Op is "both" or "monthly" && !new MonthlyPush(db, http, global, opts).Run()) failed = true;
+if (opts.Op is "both" or "monthly" && !new MonthlyPush(db, connStr, http, global, opts).Run()) failed = true;
 return failed ? 1 : 0;
 
 // ---------------------------------------------------------------------------

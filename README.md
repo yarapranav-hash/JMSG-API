@@ -21,6 +21,7 @@ winamr/
     02_create_PushConfig_Monthly.sql  monthly mapping + push log tables
     03_monthly_quote_and_ukscno.sql   Quote column (its ukscno part is superseded: ukscno is now UniqueServiceNo)
     03_monthly_max_increase.sql       120% rule setting
+    04_create_PushData_Monthly.sql    table with the values sent / skipped per service
   preview/                        CSV previews and a sample request for Postman
 ```
 
@@ -45,11 +46,7 @@ It writes the preview file `monthly_preview_2026-10-01.csv` (one row per record 
 dotnet run -c Release --no-build -- --op monthly --date 2026-10-01 --limit 1   # first test: ONE real service
 dotnet run -c Release --no-build -- --op monthly --date 2026-10-01             # everything
 ```
-Without `--dry-run`/`--csv` the app writes the preview file first (default `MeterPush\preview\monthly_<date>.csv`), then asks:
-```
-Type yes to push N record(s) to <endpoint> (anything else cancels):
-```
-Only `yes` sends the records. Anything else cancels, and then nothing is sent and nothing is written to the log.
+Without `--dry-run`/`--csv` the app writes the preview file first (default `MeterPush\preview\monthly_<date>.csv`) and then **sends straight away**, with no confirmation. To look at the data without sending, use the preview-only command above, or start with `--limit 1`.
 
 | Option | Meaning |
 |---|---|
@@ -71,7 +68,9 @@ The exit code is `0` if no service failed and `1` if any failed.
 - **Push date** is today, or the `--date` value.
 - **Opening date** is the push date minus 1 month. For example, push date 2026-10-01 gives opening date 2026-09-01.
 
-### Step 3: Read the meter readings (stored procedure, called twice)
+### Step 3: Read the meter readings (stored procedure)
+All the dates the run may need (push date, opening date plus `OPENING_FORWARD_DAYS` days after it, last day of the previous month plus `MD_LOOKBACK_DAYS` days before it) are requested **in parallel**, each call on its own connection, `PROC_PARALLELISM` (default 5) at a time. The console prints a line when each call starts and when it returns, with the number of services and the seconds it took. The older description of two calls below is the core of it.
+
 The app calls `dbo.PrBLSTotalDCWiseMeterDataInstantDay @Date, @DC = NULL, @stmt = 'ALL'`:
 - Once for the push date. This is the **NEW** reading, used for the closing values, `meter_no`, `rmd_kva`, `rmd_kwh` and `date_time`.
 - Once for the opening date. This is the **OLD** reading, used for the opening values.
@@ -92,19 +91,23 @@ From `dbo.ServiceDetails` (`IsActive = 1`) the app loads `ServiceNo`, `UniqueSer
 From `dbo.PushLog_Monthly` it loads the services with `Status = 'OK'` for this push date, so they are not sent twice.
 
 ### Step 6: Go through each service, in `ServiceNo` order
-Each service in the push-date result is checked in this order. The first check that fails **skips** the service. The reason is listed in the `_skipped.csv` preview, and after you type `yes` it is written to `PushLog_Monthly` with `Status = 'SKIPPED'`.
+Each service in the push-date result is checked in this order. The first check that fails **skips** the service. The reason is listed in the `_skipped.csv` preview, and in a real run it is written to `PushLog_Monthly` with `Status = 'SKIPPED'`.
 
-The opening and closing kWh are read from the procedure only for checks 6 and 7. They are **not sent** (`opening_kwh`, `opening_kvah` and `consumed_units` are empty).
+The opening and closing kWh are read from the procedure only for checks 6 and 7. The real opening reading is **not sent** (`opening_kwh` and `opening_kvah` are fixed `0`), but `consumed_units` is sent: closing kWh minus the opening kWh reading.
 
 | # | Check | Skip reason in the log |
 |---|---|---|
 | 1 | Already logged OK for this push date | not sent again, and left out of the preview |
 | 2 | The service is not in `ServiceDetails` with `IsActive = 1` | `service not found (active) in ServiceDetails` |
 | 3 | `ServiceDetails.UniqueServiceNo` is not exactly 9 digits (or empty) | `no valid 9-digit UniqueServiceNo in ServiceDetails` |
-| 4 | The service has no reading in the opening-date result | `no reading for <opening date> (opening)` |
+| 4 | The service has no reading on the opening date or (and, if `OPENING_FORWARD_DAYS` is above 0, on that many following days; it is 0 now, so only the opening date is checked) | `no reading for <opening date> (opening)` |
 | 5 | A mapped value can't be built (missing column), or the opening/closing kWh is missing | the error message / `opening or closing kWh reading missing` |
 | 6 | Closing is lower than opening, for example a replaced meter | `closing < opening (consumed -x) - meter replaced/rolled over?` |
 | 7 | **The 120% rule:** (closing_kwh - opening_kwh) / opening_kwh x 100 is greater than `MONTHLY_MAX_INCREASE_PCT` | `increase x% > 120% (opening ..., closing ...)` |
+
+| 8 | `rmd_kva` or `rmd_kwh` is greater than `MONTHLY_MAX_MD` (default 6) | `rmd_kva 28592807.76 > 6` |
+
+A service with no MD value (no reading on the allowed days) is skipped before these checks, with the reason `no rmd_kva/rmd_kwh reading on <date> or the N day(s) before`.
 
 About the 120% rule (check 7):
 - The services sent are those with an increase of **120% or less**.
@@ -114,8 +117,8 @@ About the 120% rule (check 7):
 ### Step 7: Build the values
 Each mapped parameter is filled according to its `SourceType`. See section 5.
 
-### Step 8: Build the request, show the preview, send after `yes`
-- The preview file is written first and the app waits for you to type `yes` (see section 2).
+### Step 8: Build the request, write the preview, send
+- The preview file is written first and the records are then sent without a confirmation (see section 2).
 - The values are put in a SOAP 1.1 `setMonthly` envelope (namespace `http://service.tg.spd`), in `SortOrder`.
 - Elements with an empty value are left out.
 - Parameters with `Quote = 1` are wrapped in single quotes (`'A08798'`). The API puts the values straight into its own SQL, so text values need the quotes.
@@ -147,6 +150,7 @@ The API replies with HTTP 200 even when its own insert fails, so the app reads t
 | `dbo.PushConfig` | Global settings: endpoint, SOAP username and password, timeout, `MONTHLY_MAX_INCREASE_PCT`. Also holds the draft hourly mapping. |
 | `dbo.PushConfig_Monthly` | The parameter mapping for `setMonthly`. |
 | `dbo.PushLog_Monthly` | One row per service and push date: `OK`, `FAILED` or `SKIPPED`, with the reply or reason. |
+| `dbo.PushData_Monthly` | One row per service and push date with every parameter value as sent (or as built, for skipped services), the reply or skip reason, the opening kWh and the dates the opening and MD readings came from, and the request XML (password masked). Written during a real run (not by `--dry-run`/`--csv`). Created by `sql\04_create_PushData_Monthly.sql`. |
 
 `PushLog_Monthly` has a unique key on `(PushDate, ServiceNo)`. A rerun updates the row instead of adding a new one.
 
@@ -160,26 +164,27 @@ The API replies with HTTP 200 even when its own insert fails, so the app reads t
 | `ukscno` | `ServiceDetails.UniqueServiceNo` | The 9-digit unique number, for example `101463320` |
 | `meter_no` | `PROC_NEW` `MSN` | Sent in single quotes: `'A08798'` |
 | `meter_phase` | `CONST` `1` | |
-| `tariff_category` | `CONST` empty | Not sent |
+| `tariff_category` | `CONST` `1` | |
 | `date_time` | `PROC_NEW` `Date & Time` | Format `dd/MM/yyyy hh:mm:ss tt`, for example `01/10/2026 08:30:00 PM` |
 | `op_rdgdt` | push date minus 1 month | `dd/MM/yyyy` |
 | `bill_date` | push date | `dd/MM/yyyy` |
-| `bill_processdt` | `CONST` empty | Not sent |
-| `rmd_kva` | `PROC_PREVEND` `MD kVA` | From the last day of the month before the push date (push 2026-10-01 -> 2026-09-30), latest reading that day. If the meter has no reading that day, the previous day is used, and so on, up to `MD_LOOKBACK_DAYS` (default 7) days back. Left out if none is found. |
+| `bill_processdt` | push date | `dd/MM/yyyy` |
+| `rmd_kva` | `PROC_PREVEND` `MD kVA` | From the last day of the month before the push date (push 2026-10-01 -> 2026-09-30), latest reading that day. `MD_LOOKBACK_DAYS` (now 1) says how many earlier days are searched when a meter has no reading that day (09-30, then 09-29). **A meter with no MD value after that is skipped** (`no rmd_kva/rmd_kwh reading on 2026-09-30 or the 1 day(s) before`). Left out if none is found. |
 | `rmd_kwh` | `PROC_PREVEND` `MD kW` | Same date logic as `rmd_kva`. The procedure has no MD kWh, so MD kW is used |
-| `contract_load` | `CONST` empty | Not sent |
-| `billing_type` | `CONST` empty | Not sent |
-| `opening_kwh` | `CONST` empty | Not sent (the opening reading is only used for the checks) |
-| `opening_kvah` | `CONST` empty | Not sent |
+| `contract_load` | `ServiceDetails.ContractedLoad` | Without trailing zeros: `1.00` is sent as `1` |
+| `billing_type` | `CONST` `kWh` | Not quoted |
+| `opening_kwh` | `CONST` `0` | Fixed `0`; the real opening reading is only used for the checks and `consumed_units` |
+| `opening_kvah` | `CONST` `0` | |
 | `closing_kwh` | `PROC_NEW` `Meter Reading(kWh)` | Reading on the push date |
 | `closing_kvah` | `PROC_NEW` `Meter Reading(kVAh)` | Reading on the push date |
 | `status` | `CONST` `01` | |
-| `noof_months` | `CONST` empty | Not sent |
+| `noof_months` | `CONST` `1` | |
 | `billing_status` | `CONST` `01` | |
-| `consumed_units` | `CONST` empty | Not sent |
+| `consumed_units` | `CALC` `closing_kwh - opening_kwh_reading` | Closing kWh minus the opening kWh reading (not sent itself), rounded to 2 decimals, e.g. `53.25` |
 | `energy_consumed_amount`, `fixed_charges`, `minimum_charges`, `customer_charges`, `total_deduction_amount`, `ed_charges`, `op_balance`, `adj_charges`, `closing_balance` | `CONST` `0` | No source in the DB |
 | `old_finkwh`, `old_finkvah`, `old_rmd`, `diff_amt` | `CONST` `0` | |
 | `meter_chgdt`, `diff_amt_bldt`, `diff_amt_sentdt` | `CONST` empty | The elements are not sent |
+| `scno` | `ServiceDetails.ServiceNo` | Spaces removed: `0216 00003` becomes `021600003`; not quoted |
 | `username`, `password` | `PushConfig` global settings | `SOAP_USERNAME`, `SOAP_PASSWORD` |
 
 **Changing a mapping needs no code change.** Update the row in `PushConfig_Monthly`, for example:
