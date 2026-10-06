@@ -150,7 +150,8 @@ class MonthlyPush
                 Soap.Envelope(Op, prms.Select(p => (p.Name, Quoted(p, values[p.Name])))), isDone, info));
         }
 
-        var toSend = items.Where(i => !i.Done).Take(limit).ToList();
+        // --ignore-log: services already logged OK are sent again too
+        var toSend = items.Where(i => opts.IgnoreLog || !i.Done).Take(limit).ToList();
 
         // ---- preview document: exactly what would go to the API (password hidden)
         var previewFile = opts.Csv ?? Path.Combine(Environment.CurrentDirectory, "preview", $"monthly_{pushDate:yyyy-MM-dd}.csv");
@@ -158,7 +159,7 @@ class MonthlyPush
         var skippedFile = Path.ChangeExtension(previewFile, null) + "_skipped.csv";
         var newSkips = skips.Count(s => !s.Done);
         Log($"setMonthly: preview written to {previewFile} ({toSend.Count} rows) and {skippedFile} ({newSkips} rows)");
-        Log($"setMonthly: to push {toSend.Count}, already sent OK {items.Count(i => i.Done)}, skipped {newSkips}");
+        Log($"setMonthly: to push {toSend.Count}, already sent OK {items.Count(i => i.Done)}{(opts.IgnoreLog ? " (sent again: --ignore-log)" : "")}, skipped {newSkips}");
 
         if (opts.DryRun)
         {

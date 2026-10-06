@@ -55,6 +55,7 @@ Without `--dry-run`/`--csv` the app writes the preview file first (default `Mete
 | `--csv file.csv` | Where to write the preview (and `file_skipped.csv`). Implies `--dry-run`. |
 | `--limit N` | Preview and send at most N records. Use `1` for a first test. |
 | `--date yyyy-MM-dd` | The push date. The default is today. |
+| `--ignore-log` | Also send the services already logged OK for the push date (resend everything). Their log and data rows are updated with the new reply and values. |
 
 The exit code is `0` if no service failed and `1` if any failed.
 

@@ -12,6 +12,7 @@ using Microsoft.Data.SqlClient;
 //   MeterPush --limit 5               push at most 5 rows/services per operation (first test)
 //   MeterPush --op monthly --csv f.csv   write everything setMonthly would send to f.csv (+ f_skipped.csv); sends nothing
 //   MeterPush --date 2026-10-01      monthly push date (default: today); opening = this date - 1 month
+//   MeterPush --op monthly --ignore-log   also send services already logged OK for the push date (resend everything)
 
 var opts = ParseArgs(args);
 var settingsPath = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
@@ -127,6 +128,7 @@ static Opts ParseArgs(string[] a)
         switch (a[i])
         {
             case "--dry-run": o.DryRun = true; break;
+            case "--ignore-log": o.IgnoreLog = true; break;
             case "--op": o.Op = a[++i].ToLowerInvariant(); break;
             case "--limit": o.Limit = int.Parse(a[++i]); break;
             case "--csv": o.Csv = Path.GetFullPath(a[++i]); o.DryRun = true; break;
@@ -141,4 +143,4 @@ static Opts ParseArgs(string[] a)
 static void Log(string m) => Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {m}");
 
 record Cfg(int ConfigId, string Operation, string ParamName, string SourceType, string? SourceValue, int SortOrder, bool IsActive);
-class Opts { public bool DryRun; public string Op = "both"; public int Limit; public DateTime? Date; public string? Csv; }
+class Opts { public bool DryRun; public bool IgnoreLog; public string Op = "both"; public int Limit; public DateTime? Date; public string? Csv; }
