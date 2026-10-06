@@ -11,11 +11,18 @@ This document describes the **monthly push (`setMonthly`)**, which is finished a
 ```
 winamr/
   README.md                       this file
-  MeterPush/                      the app
+  MeterPush/                      the command-line app (run from this folder)
     Program.cs                    command-line options, hourly push (draft), starts the monthly push
-    MonthlyPush.cs                the whole monthly push (fetch, filter, build, send, log)
-    Soap.cs                       builds the SOAP envelope, posts it, classifies the reply
+    MonthlyPush.cs                the whole monthly push (plan, send, log); shared with the web app
+    Soap.cs                       builds the SOAP envelope, posts it, classifies the reply (shared)
+    Opts.cs                       the options record (shared)
     appsettings.json              SQL Server connection string
+  MeterPush.Web/                  the browser page (run from this folder)
+    Program.cs                    the page's API (preview, send, history)
+    Runner.cs                     runs previews and sends in the background, keeps the previews
+    wwwroot/index.html            the page (Run and History tabs)
+    start-web.bat                 starts the page
+    appsettings.json              connection string, access code, address (http://0.0.0.0:5080)
   sql/
     01_create_PushConfig.sql          global settings + hourly draft mapping
     02_create_PushConfig_Monthly.sql  monthly mapping + push log tables
@@ -71,11 +78,19 @@ The exit code is `0` if no service failed and `1` if any failed.
 
 `MeterPush.Web` is a small web app that does the same monthly push in a browser. It uses the same code as the console app (`MonthlyPush.cs`, `Soap.cs`, `Opts.cs` are shared), and the same tables.
 
+**With the UI (browser page)**
+
+- Folder: `C:\Users\ecil\Desktop\winamr\MeterPush.Web`
+
 ```powershell
 cd C:\Users\ecil\Desktop\winamr\MeterPush.Web
 dotnet build -c Release          # once, and after any code change
-start-web.bat                    # or: dotnet bin\Release\net7.0\MeterPush.Web.dll
+.\start-web.bat                  # in PowerShell the .\ is needed; or: dotnet bin\Release\net7.0\MeterPush.Web.dll
 ```
+
+Keep that window open while the page is in use. Press `Ctrl+C` (and answer `Y`) to stop it. The window also shows the push log lines.
+
+**Without the UI (command line):** see the commands at the top of this section; run them from `C:\Users\ecil\Desktop\winamr\MeterPush`.
 
 Open `http://<this PC's name or IP>:5080` from any PC on the network. The address and the access code are in `MeterPush.Web\appsettings.json` (`Urls`, `AccessCode`). Change the code before sharing the page. Windows may ask to allow the app through the firewall; allow port 5080 for the private network only. Keep it inside the network.
 
