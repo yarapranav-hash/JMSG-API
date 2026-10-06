@@ -67,6 +67,23 @@ Normally a service already logged `OK` for the push date is skipped, so a rerun 
 
 The exit code is `0` if no service failed and `1` if any failed.
 
+### Web page (for people who don't use the command line)
+
+`MeterPush.Web` is a small web app that does the same monthly push in a browser. It uses the same code as the console app (`MonthlyPush.cs`, `Soap.cs`, `Opts.cs` are shared), and the same tables.
+
+```powershell
+cd C:\Users\ecil\Desktop\winamr\MeterPush.Web
+dotnet build -c Release          # once, and after any code change
+start-web.bat                    # or: dotnet bin\Release\net7.0\MeterPush.Web.dll
+```
+
+Open `http://<this PC's name or IP>:5080` from any PC on the network. The address and the access code are in `MeterPush.Web\appsettings.json` (`Urls`, `AccessCode`). Change the code before sharing the page. Windows may ask to allow the app through the firewall; allow port 5080 for the private network only. Keep it inside the network.
+
+- **Run tab:** pick the push date (optionally "test with only N meters" and "also resend meters already sent"), press **Preview**. It reads the meter data (1 to 5 minutes) and shows how many records will be sent, how many are already sent and how many are skipped and why. A table lists every record (click a row to see all 39 values and the XML), another lists the skipped meters. Both can be downloaded as CSV. **Send to vendor API** asks for a confirmation and then sends exactly what the preview showed, one by one, with a progress bar, a live log and a **Stop** button. A preview can be sent only once, so nothing is sent twice by accident.
+- **History tab:** per push date, the counts of sent (OK), failed and skipped meters; a filterable list; click a row to see everything that was sent and the API's reply. **Retry failed** opens the Run tab for that date (failed meters are included automatically).
+- Only one preview or send runs at a time. A preview is kept for 3 hours.
+- It needs the same settings as the console app (`PushConfig`, `PushConfig_Monthly`, `PushData_Monthly`).
+
 ## 3. Step by step: what a monthly run does
 
 ### Step 1: Load the configuration
@@ -180,7 +197,7 @@ The API replies with HTTP 200 even when its own insert fails, so the app reads t
 | `bill_processdt` | push date | `dd/MM/yyyy` |
 | `rmd_kva` | `PROC_PREVEND` `MD kVA` | From the last day of the month before the push date (push 2026-10-01 -> 2026-09-30), latest reading that day. `MD_LOOKBACK_DAYS` (now 1) says how many earlier days are searched when a meter has no reading that day (09-30, then 09-29). **A meter with no MD value after that is skipped** (`no rmd_kva/rmd_kwh reading on 2026-09-30 or the 1 day(s) before`). Left out if none is found. |
 | `rmd_kwh` | `PROC_PREVEND` `MD kW` | Same date logic as `rmd_kva`. The procedure has no MD kWh, so MD kW is used |
-| `contract_load` | `CONST` empty | Optional, not sent (it used to come from `ServiceDetails.ContractedLoad`) |
+| `contract_load` | `CONST` `null` (being tested) | The API needs the element: left empty or out, every request fails with `Un-Successful:null` (seen on 2026-10-06: all 5 records sent without it failed, all records sent with `ServiceDetails.ContractedLoad` were accepted). Now sent as the text `null`; if the API rejects that, go back to `SERVICE` `ContractedLoad` (without trailing zeros: `1.00` becomes `1`) |
 | `billing_type` | `CONST` `kWh` | Not quoted |
 | `opening_kwh` | `CONST` `0` | Fixed `0`; the real opening reading is only used for the checks and `consumed_units` |
 | `opening_kvah` | `CONST` `0` | |

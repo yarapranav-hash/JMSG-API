@@ -14,9 +14,9 @@ class MonthlyPush
     const string Proc = "dbo.PrBLSTotalDCWiseMeterDataInstantDay";
     static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
 
-    record Param(string Name, int Sort, string Type, string? Value, int? OffsetMonths, string? Format, bool Quote);
-    record Svc(string ServiceNo, string? Unique, decimal? ContractedLoad);
-    class Reading : Dictionary<string, string?> { public Reading() : base(StringComparer.OrdinalIgnoreCase) { } }
+    internal record Param(string Name, int Sort, string Type, string? Value, int? OffsetMonths, string? Format, bool Quote);
+    internal record Svc(string ServiceNo, string? Unique, decimal? ContractedLoad);
+    internal class Reading : Dictionary<string, string?> { public Reading() : base(StringComparer.OrdinalIgnoreCase) { } }
 
     readonly SqlConnection db;
     readonly HttpClient http;
@@ -24,21 +24,53 @@ class MonthlyPush
     readonly Opts opts;
 
     readonly string connStr; // the parallel procedure calls open their own connections
+    readonly Action<string> logSink; // console by default; the web app collects the lines for the page
 
-    public MonthlyPush(SqlConnection db, string connStr, HttpClient http, Dictionary<string, string> global, Opts opts)
+    public MonthlyPush(SqlConnection db, string connStr, HttpClient http, Dictionary<string, string> global, Opts opts, Action<string>? log = null)
     {
         this.db = db; this.connStr = connStr; this.http = http; this.global = global; this.opts = opts;
+        logSink = log ?? (m => Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {m}"));
     }
 
+    // Command line: plan, write the preview files, then send (or stop after the preview with --dry-run / --csv).
     public bool Run()
+    {
+        var plan = Plan();
+        if (plan.Prms.Count == 0) return true;
+
+        var previewFile = opts.Csv ?? Path.Combine(Environment.CurrentDirectory, "preview", $"monthly_{plan.PushDate:yyyy-MM-dd}.csv");
+        WritePreview(previewFile, plan.Prms, plan.ToSend, plan.Skips);
+        var skippedFile = Path.ChangeExtension(previewFile, null) + "_skipped.csv";
+        Log($"setMonthly: preview written to {previewFile} ({plan.ToSend.Count} rows) and {skippedFile} ({plan.NewSkips} rows)");
+        Log($"setMonthly: to push {plan.ToSend.Count}, already sent OK {plan.Items.Count(i => i.Done)}{(opts.IgnoreLog ? " (sent again: --ignore-log)" : "")}, skipped {plan.NewSkips}");
+
+        if (opts.DryRun)
+        {
+            if (plan.ToSend.Count > 0) { Console.WriteLine($"--- sample request: {Op} {plan.ToSend[0].ServiceNo} ({plan.ToSend[0].Unique}) ---"); Console.WriteLine(MaskPassword(plan.ToSend[0].Xml)); }
+            Log("setMonthly: preview only - nothing sent, nothing written to the log");
+            return true;
+        }
+        if (plan.ToSend.Count == 0) { Log("setMonthly: nothing to push"); return true; }
+
+        // the preview files above are written first and kept; use --dry-run / --csv to look without sending
+        var result = Execute(plan);
+        return result.Failed == 0;
+    }
+
+    // ------------------------------------------------------------ plan: build everything that would be sent (nothing is sent or written)
+
+    internal PlanResult Plan()
     {
         var pushDate = opts.Date ?? DateTime.Today;
         var oldDate = pushDate.AddMonths(-1);
-        var endpoint = global["ENDPOINT"];
         var limit = opts.Limit > 0 ? opts.Limit : int.MaxValue;
 
         var prms = LoadParams();
-        if (prms.Count == 0) { Log("setMonthly: PushConfig_Monthly is empty - skipped"); return true; }
+        if (prms.Count == 0)
+        {
+            Log("setMonthly: PushConfig_Monthly is empty - skipped");
+            return new PlanResult(pushDate, global["ENDPOINT"], prms, new List<Item>(), new List<Skipped>(), new List<Item>());
+        }
 
         Log($"setMonthly: push date {pushDate:yyyy-MM-dd}, opening readings from {oldDate:yyyy-MM-dd}");
 
@@ -152,63 +184,77 @@ class MonthlyPush
 
         // --ignore-log: services already logged OK are sent again too
         var toSend = items.Where(i => opts.IgnoreLog || !i.Done).Take(limit).ToList();
+        return new PlanResult(pushDate, global["ENDPOINT"], prms, items, skips, toSend);
+    }
 
-        // ---- preview document: exactly what would go to the API (password hidden)
-        var previewFile = opts.Csv ?? Path.Combine(Environment.CurrentDirectory, "preview", $"monthly_{pushDate:yyyy-MM-dd}.csv");
-        WritePreview(previewFile, prms, toSend, skips);
-        var skippedFile = Path.ChangeExtension(previewFile, null) + "_skipped.csv";
-        var newSkips = skips.Count(s => !s.Done);
-        Log($"setMonthly: preview written to {previewFile} ({toSend.Count} rows) and {skippedFile} ({newSkips} rows)");
-        Log($"setMonthly: to push {toSend.Count}, already sent OK {items.Count(i => i.Done)}{(opts.IgnoreLog ? " (sent again: --ignore-log)" : "")}, skipped {newSkips}");
+    // ------------------------------------------------------------ execute: send the planned records one by one
 
-        if (opts.DryRun)
+    internal ExecResult Execute(PlanResult plan, Action<ExecProgress>? onProgress = null, CancellationToken ct = default)
+    {
+        prmList = plan.Prms;
+        dataCols = LoadDataColumns();
+        if (dataCols == null) Log("setMonthly: dbo.PushData_Monthly not found - sent values will not be stored (run sql\\04_create_PushData_Monthly.sql)");
+        Log($"setMonthly: pushing {plan.ToSend.Count} record(s) to {plan.Endpoint}");
+
+        foreach (var s in plan.Skips.Where(s => !s.Done))
         {
-            if (toSend.Count > 0) { Console.WriteLine($"--- sample request: {Op} {toSend[0].ServiceNo} ({toSend[0].Unique}) ---"); Console.WriteLine(MaskPassword(toSend[0].Xml)); }
-            Log("setMonthly: preview only - nothing sent, nothing written to the log");
-            return true;
-        }
-        if (toSend.Count == 0) { Log("setMonthly: nothing to push"); return true; }
-
-        // ---- phase 2: push (the preview files above are written first and kept; use --dry-run / --csv to look without sending)
-        Log($"setMonthly: pushing {toSend.Count} record(s) to {endpoint}");
-
-        foreach (var s in skips.Where(s => !s.Done))
-        {
-            WriteLog(pushDate, s.ServiceNo, s.Unique, "SKIPPED", s.Why);
-            WriteData(pushDate, s.ServiceNo, s.Unique, "SKIPPED", s.Why, s.Values, null, s.Info);
+            WriteLog(plan.PushDate, s.ServiceNo, s.Unique, "SKIPPED", s.Why);
+            WriteData(plan.PushDate, s.ServiceNo, s.Unique, "SKIPPED", s.Why, s.Values, null, s.Info);
         }
 
         var responses = new Dictionary<string, int>(); // server message -> count
-        int pushed = 0, failed = 0, consecutiveFails = 0;
-        foreach (var it in toSend)
+        int pushed = 0, failed = 0, consecutiveFails = 0, index = 0;
+        string? stoppedBecause = null;
+        foreach (var it in plan.ToSend)
         {
-            var (ok, detail) = Soap.Post(http, endpoint, Op, it.Xml);
-            WriteLog(pushDate, it.ServiceNo, it.Unique, ok ? "OK" : "FAILED", detail);
-            WriteData(pushDate, it.ServiceNo, it.Unique, ok ? "OK" : "FAILED", detail, it.Values, MaskPassword(it.Xml), it.Info);
+            if (ct.IsCancellationRequested) { stoppedBecause = "stopped by the user"; Log("setMonthly: stopped by the user"); break; }
+            var (ok, detail) = Soap.Post(http, plan.Endpoint, Op, it.Xml);
+            WriteLog(plan.PushDate, it.ServiceNo, it.Unique, ok ? "OK" : "FAILED", detail);
+            WriteData(plan.PushDate, it.ServiceNo, it.Unique, ok ? "OK" : "FAILED", detail, it.Values, MaskPassword(it.Xml), it.Info);
+            index++;
+            string line;
             if (ok)
             {
                 pushed++; consecutiveFails = 0;
                 responses[detail] = responses.GetValueOrDefault(detail) + 1;
-                Log($"setMonthly: {it.ServiceNo} ({it.Unique}) -> {detail}");
+                line = $"{it.ServiceNo} ({it.Unique}) -> {detail}";
             }
             else
             {
                 failed++; consecutiveFails++;
-                Log($"setMonthly: {it.ServiceNo} ({it.Unique}) FAILED - {detail}");
-                if (consecutiveFails >= 5) { Log("setMonthly: 5 failures in a row - stopping, rerun to retry"); break; }
+                line = $"{it.ServiceNo} ({it.Unique}) FAILED - {detail}";
             }
+            Log($"setMonthly: {line}");
+            onProgress?.Invoke(new ExecProgress(index, plan.ToSend.Count, pushed, failed, it.ServiceNo, ok, detail));
+            if (consecutiveFails >= 5) { stoppedBecause = "5 failures in a row"; Log("setMonthly: 5 failures in a row - stopping, rerun to retry"); break; }
         }
 
         foreach (var (msg, n) in responses.OrderByDescending(r => r.Value))
             Log($"setMonthly: server said '{msg}' for {n} service(s)");
-        Log($"setMonthly: done - accepted {pushed}, skipped {newSkips}, failed {failed}");
-        return failed == 0;
+        Log($"setMonthly: done - accepted {pushed}, skipped {plan.NewSkips}, failed {failed}");
+        return new ExecResult(pushed, failed, plan.NewSkips, responses, stoppedBecause);
+    }
+
+    internal sealed record ExecProgress(int Index, int Total, int Pushed, int Failed, string ServiceNo, bool Ok, string Reply);
+    internal sealed record ExecResult(int Pushed, int Failed, int Skipped, Dictionary<string, int> Replies, string? StoppedBecause);
+
+    internal sealed class PlanResult
+    {
+        public DateTime PushDate { get; }
+        public string Endpoint { get; }
+        public List<Param> Prms { get; }
+        public List<Item> Items { get; }       // everything that passed the checks (including services already sent OK)
+        public List<Skipped> Skips { get; }    // services held back, with the reason
+        public List<Item> ToSend { get; }      // what Execute will send
+        public int NewSkips => Skips.Count(s => !s.Done);
+        public PlanResult(DateTime pushDate, string endpoint, List<Param> prms, List<Item> items, List<Skipped> skips, List<Item> toSend)
+        { PushDate = pushDate; Endpoint = endpoint; Prms = prms; Items = items; Skips = skips; ToSend = toSend; }
     }
 
     // readings used by the checks (not sent): opening kWh, the date the opening reading and the MD reading came from
-    record Info(decimal? OpeningKwh, string? OpeningReadDate, string? MdReadDate);
-    record Item(string ServiceNo, string Unique, Dictionary<string, string?> Values, string Xml, bool Done, Info Info);
-    record Skipped(string ServiceNo, string? Unique, string Why, bool Done, Dictionary<string, string?>? Values, Info Info);
+    internal record Info(decimal? OpeningKwh, string? OpeningReadDate, string? MdReadDate);
+    internal record Item(string ServiceNo, string Unique, Dictionary<string, string?> Values, string Xml, bool Done, Info Info);
+    internal record Skipped(string ServiceNo, string? Unique, string Why, bool Done, Dictionary<string, string?>? Values, Info Info);
 
     const string ReadDate = "_ReadDate"; // added to every procedure row: the date it was requested for
     List<Param> prmList = new();
@@ -261,7 +307,7 @@ VALUES (@d, @n, @u, @o, @r, @ok, @od, @md, @x{(vars.Count > 0 ? ", " + string.Jo
     // procedure column used for the opening/closing sanity checks (these readings are not part of the request)
     const string KwhColumn = "Meter Reading(kWh)";
 
-    static string MaskPassword(string xml) => Regex.Replace(xml, @"(<ser:password>).*?(</ser:password>)", "$1********$2");
+    internal static string MaskPassword(string xml) => Regex.Replace(xml, @"(<ser:password>).*?(</ser:password>)", "$1********$2");
 
     // The preview holds only the records that will be pushed, with exactly the request parameters as columns.
     // Services already sent OK are left out of both files.
@@ -314,7 +360,7 @@ VALUES (@d, @n, @u, @o, @r, @ok, @od, @md, @x{(vars.Count > 0 ? ", " + string.Jo
     }
 
     // Quote=1 params are sent in single quotes ('A08767'); applied last so calculations and checks see the plain value.
-    static string? Quoted(Param p, string? value) =>
+    internal static string? Quoted(Param p, string? value) =>
         p.Quote && !string.IsNullOrEmpty(value) ? "'" + value + "'" : value;
 
     static decimal Num(Dictionary<string, string?> v, string key, string forParam) =>
@@ -443,5 +489,5 @@ IF @@ROWCOUNT=0 INSERT dbo.PushLog_Monthly (PushDate, ServiceNo, UniqueServiceNo
 
     static string Csv(string v) => v.Contains(',') || v.Contains('"') ? "\"" + v.Replace("\"", "\"\"") + "\"" : v;
 
-    static void Log(string m) => Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {m}");
+    void Log(string m) => logSink(m);
 }

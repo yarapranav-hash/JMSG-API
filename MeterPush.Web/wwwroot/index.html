@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monthly Meter Push</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --ink: #1c2330; --muted: #5b6577; --line: #dde1e8;
+    --accent: #1f5fd1; --accent-ink: #ffffff; --ok: #1a7f4b; --okbg: #e3f4ea; --warn: #9a5b00; --warnbg: #fdf0d8;
+    --bad: #b3261e; --badbg: #fbe6e4; --codebg: #f0f2f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12161d; --card: #1b212b; --ink: #e6e9ef; --muted: #9aa4b5; --line: #2f3745;
+      --accent: #5b8def; --accent-ink: #0b1220; --ok: #5fd08e; --okbg: #17382a; --warn: #f0b24b; --warnbg: #3a2e12;
+      --bad: #ff8a80; --badbg: #3d1a18; --codebg: #232b37;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { background: var(--card); border-bottom: 1px solid var(--line); padding: 12px 16px; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; }
+  nav { display: flex; gap: 4px; }
+  nav button { background: none; border: 0; padding: 8px 14px; border-radius: 8px; color: var(--muted); font: inherit; cursor: pointer; }
+  nav button.on { background: var(--codebg); color: var(--ink); font-weight: 600; }
+  main { max-width: 1180px; margin: 0 auto; padding: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 16px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+  input[type=date], input[type=number], input[type=text], input[type=password], select {
+    font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--ink); min-width: 0;
+  }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
+  .check { display: flex; gap: 8px; align-items: center; font-size: 14px; color: var(--ink); margin: 0; }
+  button.primary, button.secondary, button.danger { font: inherit; padding: 9px 16px; border-radius: 8px; border: 1px solid transparent; cursor: pointer; font-weight: 600; }
+  button.primary { background: var(--accent); color: var(--accent-ink); }
+  button.secondary { background: var(--card); color: var(--ink); border-color: var(--line); }
+  button.danger { background: var(--bad); color: #fff; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 4px; }
+  .stat { border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .stat b { display: block; font-size: 26px; line-height: 1.1; }
+  .stat span { color: var(--muted); font-size: 13px; }
+  .stat.ok b { color: var(--ok); } .stat.warn b { color: var(--warn); } .stat.bad b { color: var(--bad); }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--card); }
+  td.wrap { white-space: normal; min-width: 220px; }
+  tr.click { cursor: pointer; } tr.click:hover { background: var(--codebg); }
+  .scroll { overflow: auto; max-height: 420px; border: 1px solid var(--line); border-radius: 8px; }
+  .tabs { display: flex; gap: 4px; margin: 12px 0 8px; border-bottom: 1px solid var(--line); }
+  .tabs button { background: none; border: 0; padding: 8px 12px; font: inherit; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; }
+  .tabs button.on { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
+  .pill { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .pill.OK { background: var(--okbg); color: var(--ok); } .pill.SKIPPED { background: var(--warnbg); color: var(--warn); } .pill.FAILED { background: var(--badbg); color: var(--bad); }
+  .bar { height: 12px; background: var(--codebg); border-radius: 999px; overflow: hidden; }
+  .bar > div { height: 100%; background: var(--accent); width: 0; transition: width .3s; }
+  pre { background: var(--codebg); border-radius: 8px; padding: 10px; font: 12.5px/1.4 ui-monospace, Consolas, monospace; overflow: auto; max-height: 260px; margin: 8px 0 0; white-space: pre-wrap; }
+  .muted { color: var(--muted); } .small { font-size: 13px; }
+  .msg { padding: 10px 12px; border-radius: 8px; margin: 10px 0; }
+  .msg.bad { background: var(--badbg); color: var(--bad); } .msg.ok { background: var(--okbg); color: var(--ok); } .msg.warn { background: var(--warnbg); color: var(--warn); }
+  .hidden { display: none !important; }
+  .modal { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 10; }
+  .modal .box { background: var(--card); border-radius: 12px; padding: 20px; max-width: 520px; width: 100%; border: 1px solid var(--line); max-height: 90vh; overflow: auto; }
+  .modal .box.wide { max-width: 860px; }
+  .modal h3 { margin: 0 0 8px; }
+  .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; flex-wrap: wrap; }
+  .kv { display: grid; grid-template-columns: 200px 1fr; gap: 2px 12px; font-size: 13.5px; }
+  .kv div:nth-child(odd) { color: var(--muted); } .kv .empty { color: var(--muted); font-style: italic; }
+  @media (max-width: 640px) { .kv { grid-template-columns: 1fr; } .kv div:nth-child(odd) { margin-top: 6px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Monthly Meter Push</h1>
+  <nav>
+    <button id="navRun" class="on">Run</button>
+    <button id="navHist">History</button>
+  </nav>
+  <span class="muted small" style="margin-left:auto">Vendor API: setMonthly</span>
+</header>
+
+<main>
+  <!-- ============================== RUN ============================== -->
+  <section id="run">
+    <div class="card">
+      <h2>1. Choose what to push</h2>
+      <div class="row">
+        <div><label for="date">Push date</label><input type="date" id="date"></div>
+        <div><label for="limit">Test with only this many meters (optional)</label><input type="number" id="limit" min="1" placeholder="all" style="width:130px"></div>
+        <label class="check"><input type="checkbox" id="ignoreLog"> Also resend meters already sent for this date</label>
+        <button class="primary" id="btnPreview">Preview</button>
+      </div>
+      <p class="muted small" style="margin:10px 0 0">Preview only reads the meter data and shows what would be sent. Nothing goes to the vendor until you press Send.</p>
+      <div id="runMsg"></div>
+    </div>
+
+    <div class="card hidden" id="progressCard">
+      <h2 id="progressTitle">Working...</h2>
+      <div class="bar"><div id="bar"></div></div>
+      <p class="small" id="progressText" style="margin:8px 0 0"></p>
+      <div class="actions" style="justify-content:flex-start"><button class="danger hidden" id="btnStop">Stop</button></div>
+      <details><summary class="small muted" style="cursor:pointer;margin-top:8px">Show log</summary><pre id="logBox"></pre></details>
+    </div>
+
+    <div class="card hidden" id="planCard">
+      <h2>2. Check the preview <span class="muted small" id="planTitle"></span></h2>
+      <div class="stats">
+        <div class="stat ok"><b id="stSend">0</b><span>will be sent</span></div>
+        <div class="stat"><b id="stDone">0</b><span>already sent earlier</span></div>
+        <div class="stat warn"><b id="stSkip">0</b><span>skipped (not sent)</span></div>
+      </div>
+      <div id="breakdown" class="small" style="margin:12px 0 0"></div>
+
+      <div class="tabs"><button id="tabSend" class="on">To send</button><button id="tabSkip">Skipped</button></div>
+      <div class="row" style="margin-bottom:8px">
+        <div><input type="text" id="search" placeholder="Search service / meter..." style="width:260px"></div>
+        <button class="secondary" id="btnDl">Download as Excel (CSV)</button>
+      </div>
+      <div class="scroll"><table id="planTable"></table></div>
+      <div class="row small" style="margin-top:8px"><button class="secondary" id="prev">Previous</button><button class="secondary" id="next">Next</button><span class="muted" id="pageInfo"></span></div>
+
+      <div class="actions" style="justify-content:flex-start;margin-top:20px;border-top:1px solid var(--line);padding-top:16px">
+        <button class="primary" id="btnSend">Send to vendor API</button>
+        <span class="muted small" id="sendHint"></span>
+      </div>
+    </div>
+
+    <div class="card hidden" id="resultCard">
+      <h2>3. Result</h2>
+      <div id="resultBody"></div>
+    </div>
+  </section>
+
+  <!-- ============================== HISTORY ============================== -->
+  <section id="hist" class="hidden">
+    <div class="card">
+      <h2>Push history</h2>
+      <div class="row">
+        <div><label for="hDate">Push date</label><select id="hDate" style="min-width:150px"></select></div>
+        <div><label for="hStatus">Outcome</label>
+          <select id="hStatus"><option value="">All</option><option value="OK">Sent (OK)</option><option value="FAILED">Failed</option><option value="SKIPPED">Skipped</option></select></div>
+        <div><label for="hSearch">Search</label><input type="text" id="hSearch" placeholder="service, unique no, meter, reply" style="width:260px"></div>
+        <button class="primary" id="hGo">Show</button>
+        <button class="secondary hidden" id="hRetry">Retry failed &rarr; open in Run</button>
+      </div>
+      <div class="stats" id="hStats" style="margin-top:14px"></div>
+      <div class="scroll" style="margin-top:12px"><table id="hTable"></table></div>
+      <p class="muted small" id="hNote"></p>
+    </div>
+  </section>
+</main>
+
+<!-- access code -->
+<div class="modal hidden" id="codeModal"><div class="box">
+  <h3>Access code</h3><p class="muted small">Enter the access code to use this page.</p>
+  <input type="password" id="codeInput" style="width:100%" autocomplete="off">
+  <div id="codeErr" class="msg bad hidden">Wrong access code.</div>
+  <div class="actions"><button class="primary" id="codeOk">Continue</button></div>
+</div></div>
+
+<!-- confirm send -->
+<div class="modal hidden" id="confirmModal"><div class="box">
+  <h3>Send to the vendor API?</h3>
+  <p id="confirmText"></p>
+  <p class="small muted">Records already accepted by the vendor cannot be taken back from here.</p>
+  <div class="actions"><button class="secondary" id="confirmNo">Cancel</button><button class="primary" id="confirmYes">Yes, send</button></div>
+</div></div>
+
+<!-- detail -->
+<div class="modal hidden" id="detailModal"><div class="box wide">
+  <h3 id="detailTitle"></h3>
+  <div id="detailBody"></div>
+  <div class="actions"><button class="secondary" id="detailClose">Close</button></div>
+</div></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let code = localStorage.getItem('accessCode') || '';
+let plan = null, view = 'send', page = 0, jobId = null, nextLine = 0, pollTimer = null;
+const PAGE = 50;
+
+// ---------- api
+async function api(path, opts = {}) {
+  const res = await fetch('/api' + path, {
+    ...opts, headers: { 'Content-Type': 'application/json', 'X-Access-Code': code, ...(opts.headers || {}) }
+  });
+  if (res.status === 401) { await askCode(true); return api(path, opts); }
+  if (opts.raw) return res;
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ('Request failed (' + res.status + ')'));
+  return data;
+}
+function askCode(wrong) {
+  return new Promise(resolve => {
+    $('codeErr').classList.toggle('hidden', !wrong);
+    $('codeModal').classList.remove('hidden');
+    $('codeInput').value = ''; $('codeInput').focus();
+    const done = () => { code = $('codeInput').value; localStorage.setItem('accessCode', code); $('codeModal').classList.add('hidden'); resolve(); };
+    $('codeOk').onclick = done;
+    $('codeInput').onkeydown = e => { if (e.key === 'Enter') done(); };
+  });
+}
+const showMsg = (kind, text) => { $('runMsg').innerHTML = text ? `<div class="msg ${kind}">${esc(text)}</div>` : ''; };
+
+// ---------- navigation
+$('navRun').onclick = () => nav('run'); $('navHist').onclick = () => { nav('hist'); loadDates(); };
+function nav(w) {
+  $('run').classList.toggle('hidden', w !== 'run'); $('hist').classList.toggle('hidden', w !== 'hist');
+  $('navRun').classList.toggle('on', w === 'run'); $('navHist').classList.toggle('on', w === 'hist');
+}
+
+// ---------- run: preview
+function firstOfMonth() { const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1).toLocaleDateString('sv-SE'); }
+$('date').value = firstOfMonth();
+
+$('btnPreview').onclick = async () => {
+  showMsg('', ''); $('planCard').classList.add('hidden'); $('resultCard').classList.add('hidden');
+  try {
+    const r = await api('/preview', { method: 'POST', body: JSON.stringify({
+      date: $('date').value, limit: $('limit').value ? +$('limit').value : null, ignoreLog: $('ignoreLog').checked }) });
+    startPolling(r.jobId, 'Reading the meter data (about a minute)...');
+  } catch (e) { showMsg('bad', e.message); }
+};
+
+let jobStart = 0;
+const elapsed = () => { const s = Math.floor((Date.now() - jobStart) / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+
+function startPolling(id, title) {
+  jobId = id; nextLine = 0; $('logBox').textContent = ''; jobStart = Date.now();
+  $('progressCard').classList.remove('hidden'); $('progressTitle').textContent = title;
+  $('btnPreview').disabled = true; $('btnSend').disabled = true;
+  clearInterval(pollTimer); pollTimer = setInterval(poll, 1000); poll();
+}
+
+async function poll() {
+  let j;
+  try { j = await api(`/jobs/${jobId}?from=${nextLine}`); }
+  catch (e) { $('progressText').textContent = 'Cannot reach the server (' + e.message + ') - retrying. Running for ' + elapsed(); return; }
+  if (j.lines.length) {
+    const box = $('logBox'); const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+    box.textContent += j.lines.join('\n') + '\n'; nextLine = j.nextLine; if (atEnd) box.scrollTop = box.scrollHeight;
+  }
+  const isSend = j.kind === 'send';
+  $('btnStop').classList.toggle('hidden', !(isSend && j.state === 'Running'));
+  if (isSend) {
+    const pct = j.total ? Math.round(j.index / j.total * 100) : 0;
+    $('bar').style.width = pct + '%';
+    $('progressTitle').textContent = j.state === 'Running' ? 'Sending to the vendor API...' : 'Finished';
+    $('progressText').textContent = `${j.index} of ${j.total} sent - accepted ${j.pushed}, failed ${j.failed}`;
+  } else {
+    $('bar').style.width = j.state === 'Running' ? '40%' : '100%';
+    $('progressText').textContent = j.state === 'Running'
+      ? `Running for ${elapsed()}. Reading the meter data can take 1 to 7 minutes, longer when the database is busy - please wait.` : '';
+  }
+  if (j.state === 'Running') return;
+
+  clearInterval(pollTimer); $('btnPreview').disabled = false;
+  if (j.state === 'Failed') { showMsg('bad', 'Failed: ' + j.error); $('progressCard').classList.add('hidden'); return; }
+  if (isSend) showResult(j); else { $('progressCard').classList.add('hidden'); loadPlan(j.planId); }
+}
+
+// ---------- run: plan
+async function loadPlan(id) {
+  try { plan = await api('/plans/' + id); } catch (e) { showMsg('bad', e.message); return; }
+  $('planCard').classList.remove('hidden');
+  $('planTitle').textContent = '- push date ' + plan.pushDate + (plan.limit ? ` - test limit ${plan.limit}` : '') + (plan.ignoreLog ? ' - resending already sent meters' : '');
+  $('stSend').textContent = plan.toSend; $('stDone').textContent = plan.alreadySent; $('stSkip').textContent = plan.skipped;
+  $('breakdown').innerHTML = plan.skippedBreakdown.length
+    ? '<b>Why meters are skipped:</b> ' + plan.skippedBreakdown.map(b => `${esc(b.reason)} (${b.count})`).join(' &middot; ') : '';
+  $('btnSend').disabled = plan.toSend === 0 || plan.sent;
+  $('sendHint').textContent = plan.toSend === 0 ? 'Nothing to send for this date.' : `Sends ${plan.toSend} record(s) one by one, then shows the result.`;
+  $('search').value = ''; view = 'send'; page = 0; setTabs(); loadRows();
+}
+function setTabs() { $('tabSend').classList.toggle('on', view === 'send'); $('tabSkip').classList.toggle('on', view === 'skip'); }
+$('tabSend').onclick = () => { view = 'send'; page = 0; setTabs(); loadRows(); };
+$('tabSkip').onclick = () => { view = 'skip'; page = 0; setTabs(); loadRows(); };
+let st; $('search').oninput = () => { clearTimeout(st); st = setTimeout(() => { page = 0; loadRows(); }, 300); };
+$('prev').onclick = () => { if (page > 0) { page--; loadRows(); } };
+$('next').onclick = () => { page++; loadRows(); };
+
+async function loadRows() {
+  const q = encodeURIComponent($('search').value);
+  const d = await api(`/plans/${plan.planId}/${view === 'send' ? 'records' : 'skipped'}?skip=${page * PAGE}&take=${PAGE}&q=${q}`);
+  const t = $('planTable');
+  if (view === 'send') {
+    t.innerHTML = '<tr><th>Service no</th><th>Unique no (ukscno)</th><th>Meter</th><th>Reading time</th><th>Closing kWh</th><th>Consumed</th><th>MD kVA</th><th>MD kW</th><th></th></tr>' +
+      d.rows.map(r => `<tr class="click" data-s="${esc(r.serviceNo)}"><td>${esc(r.serviceNo)}</td><td>${esc(r.ukscno)}</td><td>${esc(r.meterNo)}</td><td>${esc(r.dateTime)}</td><td>${esc(r.closingKwh)}</td><td>${esc(r.consumedUnits)}</td><td>${esc(r.rmdKva)}</td><td>${esc(r.rmdKwh)}</td><td>${r.alreadySent ? '<span class="pill OK">sent before</span>' : ''}</td></tr>`).join('');
+    t.querySelectorAll('tr.click').forEach(tr => tr.onclick = () => showPlanDetail(tr.dataset.s));
+  } else {
+    t.innerHTML = '<tr><th>Service no</th><th>Unique no</th><th>Why skipped</th><th>Details</th></tr>' +
+      d.rows.map(r => `<tr><td>${esc(r.serviceNo)}</td><td>${esc(r.ukscno)}</td><td>${esc(r.category)}</td><td class="wrap muted">${esc(r.reason)}</td></tr>`).join('');
+  }
+  const from = d.total ? page * PAGE + 1 : 0, to = Math.min((page + 1) * PAGE, d.total);
+  $('pageInfo').textContent = `${from}-${to} of ${d.total}`;
+  $('prev').disabled = page === 0; $('next').disabled = to >= d.total;
+}
+
+async function showPlanDetail(serviceNo) {
+  const d = await api(`/plans/${plan.planId}/records/${encodeURIComponent(serviceNo)}`);
+  $('detailTitle').textContent = 'Service ' + serviceNo + ' - what will be sent';
+  $('detailBody').innerHTML =
+    `<p class="small muted">Opening kWh used for the checks (not sent): <b>${esc(d.openingKwh)}</b> (reading of ${esc(d.openingReadDate)}). MD values from ${esc(d.mdReadDate)}.</p>` +
+    kv(d.values.map(v => [v.name, v.sent])) + `<details><summary class="small muted" style="cursor:pointer;margin-top:10px">Show the XML request</summary><pre>${esc(d.xml)}</pre></details>`;
+  $('detailModal').classList.remove('hidden');
+}
+const kv = pairs => '<div class="kv">' + pairs.map(([k, v]) => `<div>${esc(k)}</div><div class="${v === '' || v == null ? 'empty' : ''}">${v === '' || v == null ? '(not sent)' : esc(v)}</div>`).join('') + '</div>';
+$('detailClose').onclick = () => $('detailModal').classList.add('hidden');
+
+$('btnDl').onclick = async () => {
+  const res = await api(`/plans/${plan.planId}/download/${view === 'send' ? 'records' : 'skipped'}`, { raw: true });
+  const blob = await res.blob(); const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = `monthly_${view === 'send' ? 'records' : 'skipped'}_${plan.pushDate}.csv`; a.click();
+};
+
+// ---------- run: send
+$('btnSend').onclick = () => {
+  $('confirmText').innerHTML = `Send <b>${plan.toSend}</b> record(s) for push date <b>${esc(plan.pushDate)}</b> to<br><span class="small muted">${esc(plan.endpoint)}</span>`;
+  $('confirmModal').classList.remove('hidden');
+};
+$('confirmNo').onclick = () => $('confirmModal').classList.add('hidden');
+$('confirmYes').onclick = async () => {
+  $('confirmModal').classList.add('hidden');
+  try {
+    const r = await api(`/plans/${plan.planId}/send`, { method: 'POST', body: JSON.stringify({ confirmCount: plan.toSend }) });
+    $('planCard').classList.add('hidden'); startPolling(r.jobId, 'Sending to the vendor API...');
+  } catch (e) { showMsg('bad', e.message); }
+};
+$('btnStop').onclick = async () => { $('btnStop').disabled = true; await api(`/jobs/${jobId}/stop`, { method: 'POST' }); };
+
+function showResult(j) {
+  $('progressCard').classList.add('hidden'); $('resultCard').classList.remove('hidden');
+  const bad = j.failed > 0 || j.stoppedBecause;
+  $('resultBody').innerHTML =
+    `<div class="msg ${bad ? 'warn' : 'ok'}">${j.stoppedBecause ? 'Stopped: ' + esc(j.stoppedBecause) + '. ' : ''}Accepted <b>${j.pushed}</b>, failed <b>${j.failed}</b>, of ${j.total} planned. Run Preview again to see what is left; failed meters are retried automatically.</div>` +
+    (j.replies.length ? '<div class="scroll"><table><tr><th>API reply</th><th>Meaning</th><th>Meters</th></tr>' +
+      j.replies.map(r => `<tr><td>${esc(r.reply)}</td><td>${esc(r.meaning)}</td><td>${r.count}</td></tr>`).join('') + '</table></div>' : '') +
+    '<p class="small muted">Every record and the reply is saved - see the History tab.</p>';
+}
+
+// ---------- history
+async function loadDates(select) {
+  const dates = await api('/history/dates');
+  $('hDate').innerHTML = dates.map(d => `<option>${d}</option>`).join('');
+  if (select && dates.includes(select)) $('hDate').value = select;
+  if (dates.length) loadHistory();
+}
+$('hGo').onclick = loadHistory;
+$('hSearch').onkeydown = e => { if (e.key === 'Enter') loadHistory(); };
+async function loadHistory() {
+  const d = await api(`/history?date=${$('hDate').value}&status=${$('hStatus').value}&q=${encodeURIComponent($('hSearch').value)}&take=300`);
+  const c = d.counts;
+  $('hStats').innerHTML =
+    `<div class="stat ok"><b>${c.OK || 0}</b><span>sent (OK)</span></div><div class="stat bad"><b>${c.FAILED || 0}</b><span>failed</span></div><div class="stat warn"><b>${c.SKIPPED || 0}</b><span>skipped</span></div>`;
+  $('hRetry').classList.toggle('hidden', !(c.FAILED > 0));
+  $('hTable').innerHTML = '<tr><th>Service no</th><th>Unique no</th><th>Meter</th><th>Outcome</th><th>Meaning</th><th>API reply / reason</th><th>Closing kWh</th><th>Consumed</th><th>When</th></tr>' +
+    d.rows.map(r => `<tr class="click" data-s="${esc(r.serviceNo)}"><td>${esc(r.serviceNo)}</td><td>${esc(r.ukscno)}</td><td>${esc(r.meterNo)}</td><td><span class="pill ${r.status}">${esc(r.status)}</span></td><td>${esc(r.meaning)}</td><td class="wrap muted">${esc(r.reply)}</td><td>${esc(r.closingKwh)}</td><td>${esc(r.consumedUnits)}</td><td>${esc((r.pushedOn || '').replace('T', ' ').slice(0, 19))}</td></tr>`).join('');
+  $('hTable').querySelectorAll('tr.click').forEach(tr => tr.onclick = () => showHistDetail(tr.dataset.s));
+  $('hNote').textContent = `Showing the latest ${d.rows.length} row(s) (max 300). Pushes made before the values were stored have no detail.`;
+}
+async function showHistDetail(serviceNo) {
+  const d = await api(`/history/${$('hDate').value}/${encodeURIComponent(serviceNo)}`);
+  $('detailTitle').textContent = 'Service ' + serviceNo + ' - ' + $('hDate').value;
+  $('detailBody').innerHTML = !d.found
+    ? '<p class="muted">No stored values for this record (it was pushed before values were saved, or it only has a log entry).</p>'
+    : `<p class="small"><span class="pill ${esc(d.outcome)}">${esc(d.outcome)}</span> &nbsp; ${esc(d.reply)} &nbsp; <span class="muted">${esc((d.pushedOn || '').replace('T', ' ').slice(0, 19))}</span></p>` +
+      `<p class="small muted">Opening kWh used for the checks: <b>${esc(d.openingKwh)}</b> (reading of ${esc((d.openingReadDate || '').slice(0, 10))}). MD values from ${esc((d.mdReadDate || '').slice(0, 10))}.</p>` +
+      kv(d.values.map(v => [v.name, v.sent])) + (d.xml ? `<details><summary class="small muted" style="cursor:pointer;margin-top:10px">Show the XML request</summary><pre>${esc(d.xml)}</pre></details>` : '');
+  $('detailModal').classList.remove('hidden');
+}
+$('hRetry').onclick = () => { $('date').value = $('hDate').value; $('ignoreLog').checked = false; $('limit').value = ''; nav('run'); showMsg('ok', 'Press Preview - failed meters are included automatically.'); };
+
+// ---------- start
+(async () => {
+  if (!code) await askCode(false);
+  try {
+    const a = await api('/jobs/active');
+    if (a.jobId) { nav('run'); startPolling(a.jobId, a.kind === 'send' ? 'Sending to the vendor API...' : 'Reading the meter data...'); }
+  } catch (e) { showMsg('bad', e.message); }
+})();
+</script>
+</body>
+</html>

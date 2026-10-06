@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>MeterPush</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="5.1.5" />
+  </ItemGroup>
+
+  <!-- the push logic is shared with the console app (same source files) -->
+  <ItemGroup>
+    <Compile Include="..\MeterPush\MonthlyPush.cs" Link="Shared\MonthlyPush.cs" />
+    <Compile Include="..\MeterPush\Soap.cs" Link="Shared\Soap.cs" />
+    <Compile Include="..\MeterPush\Opts.cs" Link="Shared\Opts.cs" />
+  </ItemGroup>
+
+</Project>

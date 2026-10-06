@@ -143,4 +143,3 @@ static Opts ParseArgs(string[] a)
 static void Log(string m) => Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {m}");
 
 record Cfg(int ConfigId, string Operation, string ParamName, string SourceType, string? SourceValue, int SortOrder, bool IsActive);
-class Opts { public bool DryRun; public bool IgnoreLog; public string Op = "both"; public int Limit; public DateTime? Date; public string? Csv; }
