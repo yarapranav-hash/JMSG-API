@@ -48,6 +48,14 @@ dotnet run -c Release --no-build -- --op monthly --date 2026-10-01             #
 ```
 Without `--dry-run`/`--csv` the app writes the preview file first (default `MeterPush\preview\monthly_<date>.csv`) and then **sends straight away**, with no confirmation. To look at the data without sending, use the preview-only command above, or start with `--limit 1`.
 
+**3. Resend services already logged OK (`--ignore-log`):**
+```powershell
+dotnet run -c Release --no-build -- --op monthly --date 2026-10-01 --ignore-log --dry-run --csv ..\preview\monthly_resend_2026-10-01.csv   # preview of the resend, nothing sent
+dotnet run -c Release --no-build -- --op monthly --date 2026-10-01 --ignore-log --limit 2                                               # test with 2 services
+dotnet run -c Release --no-build -- --op monthly --date 2026-10-01 --ignore-log                                                         # resend everything
+```
+Normally a service already logged `OK` for the push date is skipped, so a rerun only sends new or failed services. With `--ignore-log` the log is ignored when choosing what to send: every service that passes the checks is sent again (the services are sent in service-number order). The replies `Successful` and `Record already updated` both count as accepted. The existing rows in `PushLog_Monthly` and `PushData_Monthly` for those services are updated with the new reply and values, and no extra rows are added. Services that now fail a check are not resent, and their old `OK` log rows are left as they are. Use it when the data was sent in an older format, for example the first 2026-10-01 pushes that used the old `ukscno`.
+
 | Option | Meaning |
 |---|---|
 | `--op monthly` | Run only the monthly push. Always include it for now, because without it the draft hourly push runs too. |
@@ -172,7 +180,7 @@ The API replies with HTTP 200 even when its own insert fails, so the app reads t
 | `bill_processdt` | push date | `dd/MM/yyyy` |
 | `rmd_kva` | `PROC_PREVEND` `MD kVA` | From the last day of the month before the push date (push 2026-10-01 -> 2026-09-30), latest reading that day. `MD_LOOKBACK_DAYS` (now 1) says how many earlier days are searched when a meter has no reading that day (09-30, then 09-29). **A meter with no MD value after that is skipped** (`no rmd_kva/rmd_kwh reading on 2026-09-30 or the 1 day(s) before`). Left out if none is found. |
 | `rmd_kwh` | `PROC_PREVEND` `MD kW` | Same date logic as `rmd_kva`. The procedure has no MD kWh, so MD kW is used |
-| `contract_load` | `ServiceDetails.ContractedLoad` | Without trailing zeros: `1.00` is sent as `1` |
+| `contract_load` | `CONST` empty | Optional, not sent (it used to come from `ServiceDetails.ContractedLoad`) |
 | `billing_type` | `CONST` `kWh` | Not quoted |
 | `opening_kwh` | `CONST` `0` | Fixed `0`; the real opening reading is only used for the checks and `consumed_units` |
 | `opening_kvah` | `CONST` `0` | |
