@@ -6,6 +6,7 @@ using Microsoft.Data.SqlClient;
 class Job
 {
     public string Id = Guid.NewGuid().ToString("N")[..8];
+    public string Op = "monthly";            // monthly | hourly
     public string Kind = "";                 // preview | send
     public string State = "Running";         // Running | Done | Failed | Stopped
     public DateTime Started = DateTime.Now;
@@ -40,6 +41,14 @@ class StoredPlan
     public bool Sent;                         // a plan can be sent only once
 }
 
+class StoredHourlyPlan
+{
+    public string Id = Guid.NewGuid().ToString("N")[..10];
+    public required HourlyPush.HPlan Plan;
+    public DateTime Created = DateTime.Now;
+    public bool Sent;                         // a plan can be sent only once
+}
+
 static class Runner
 {
     static readonly object Gate = new();
@@ -49,12 +58,12 @@ static class Runner
 
     public static Job? Active { get { lock (Gate) return active is { State: "Running" } ? active : null; } }
 
-    static Job? TryStart(string kind, string pushDate, Action<Job> work, out string? error)
+    static Job? TryStart(string kind, string pushDate, Action<Job> work, out string? error, string op = "monthly")
     {
         lock (Gate)
         {
-            if (active is { State: "Running" }) { error = $"A {active.Kind} for {active.PushDate} is still running. Wait for it or stop it first."; return null; }
-            var job = new Job { Kind = kind, PushDate = pushDate };
+            if (active is { State: "Running" }) { error = $"A {active.Op} {active.Kind} for {active.PushDate} is still running. Wait for it or stop it first."; return null; }
+            var job = new Job { Kind = kind, PushDate = pushDate, Op = op };
             active = job;
             Jobs[job.Id] = job;
             error = null;
@@ -132,6 +141,58 @@ static class Runner
             job.Total = sp.Plan.ToSend.Count;
             DoSend(job, connStr, sp);
         }, out error);
+
+    // ------------------------------------------------------------ hourly (setHourly): same flow, own plans
+
+    public static readonly ConcurrentDictionary<string, StoredHourlyPlan> HPlans = new();
+
+    public static Job? StartHourlyPreview(string connStr, DateTime date, int hour, int? limit, bool ignoreLog, bool auto, out string? error) =>
+        TryStart("preview", $"{date:yyyy-MM-dd} {hour:00}:00", job =>
+        {
+            var (db, global) = Open(connStr);
+            using var dbScope = db;
+            using var http = new HttpClient();
+            var plan = new HourlyPush(db, connStr, http, global, job.Log).Plan(date, hour, limit ?? 0, ignoreLog);
+            var sp = new StoredHourlyPlan { Plan = plan };
+            HPlans[sp.Id] = sp;
+            job.PlanId = sp.Id;
+            job.Total = plan.ToSend.Count;
+            foreach (var old in HPlans.Values.Where(p => p.Created < DateTime.Now.AddHours(-3))) HPlans.TryRemove(old.Id, out _);
+
+            if (!auto) return;
+            if (plan.ToSend.Count == 0) { job.Log("Automatic mode: nothing to send."); return; }
+            if (!plan.LogReady) throw new InvalidOperationException("Cannot send: dbo.PushLog_Hourly does not exist. Run sql\\05_create_PushLog_Hourly.sql first.");
+            lock (sp) sp.Sent = true;
+            job.Kind = "send";
+            job.Log($"Automatic mode: sending {plan.ToSend.Count} record(s) without a review step.");
+            DoHourlySend(job, connStr, sp);
+        }, out error, "hourly");
+
+    public static Job? StartHourlySend(string connStr, StoredHourlyPlan sp, out string? error) =>
+        TryStart("send", sp.Plan.Label, job =>
+        {
+            job.PlanId = sp.Id;
+            job.Total = sp.Plan.ToSend.Count;
+            DoHourlySend(job, connStr, sp);
+        }, out error, "hourly");
+
+    static void DoHourlySend(Job job, string connStr, StoredHourlyPlan sp)
+    {
+        var (db, global) = Open(connStr);
+        using var dbScope = db;
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(int.Parse(global.GetValueOrDefault("TIMEOUT_SEC", "60"))) };
+        var res = new HourlyPush(db, connStr, http, global, job.Log).Execute(sp.Plan, p =>
+        {
+            job.Index = p.Index; job.Pushed = p.Pushed; job.Failed = p.Failed;
+            if (p.Ok) return;
+            var it = sp.Plan.ToSend.FirstOrDefault(i => i.ServiceNo == p.ServiceNo);
+            lock (job.Failures) job.Failures.Add(new FailRow(p.ServiceNo, it?.Unique ?? "", p.Reply, new List<string>()));
+        }, job.Cts.Token);
+        job.Pushed = res.Pushed; job.Failed = res.Failed;
+        job.Replies = res.Replies;
+        job.StoppedBecause = res.StoppedBecause;
+        job.State = res.StoppedBecause != null ? "Stopped" : "Done";
+    }
 
     static void DoSend(Job job, string connStr, StoredPlan sp)
     {

@@ -79,7 +79,7 @@ api.MapPost("/upload", async (HttpRequest req) =>
     catch (System.Xml.XmlException) { return Results.BadRequest(new { error = "This does not look like a valid .xlsx file." }); }
 });
 
-api.MapGet("/jobs/active", () => Runner.Active is { } j ? Results.Ok(new { jobId = j.Id, kind = j.Kind }) : Results.Ok(new { jobId = (string?)null }));
+api.MapGet("/jobs/active", () => Runner.Active is { } j ? Results.Ok(new { jobId = j.Id, kind = j.Kind, op = j.Op }) : Results.Ok(new { jobId = (string?)null }));
 
 api.MapGet("/jobs/{id}", (string id, int? from) =>
 {
@@ -89,7 +89,7 @@ api.MapGet("/jobs/{id}", (string id, int? from) =>
     lock (j.Lines) lines = j.Lines.Skip(start).ToArray();
     return Results.Ok(new
     {
-        id = j.Id, kind = j.Kind, state = j.State, pushDate = j.PushDate, started = j.Started, finished = j.Finished,
+        id = j.Id, op = j.Op, kind = j.Kind, state = j.State, pushDate = j.PushDate, started = j.Started, finished = j.Finished,
         planId = j.PlanId, error = j.Error, total = j.Total, index = j.Index, pushed = j.Pushed, failed = j.Failed,
         replies = j.Replies.OrderByDescending(r => r.Value).Select(r => new { reply = r.Key, count = r.Value, meaning = ReplyMeaning(r.Key) }),
         failures = FailuresOf(j).Select(f => new { serviceNo = f.ServiceNo, ukscno = f.Unique, reply = f.Reply, meaning = ReplyMeaning(f.Reply), emptyFields = f.Empty }),
@@ -196,6 +196,178 @@ api.MapPost("/plans/{id}/send", (string id, SendReq req) =>
         sp.Sent = true;
         return Results.Ok(new { jobId = job.Id });
     }
+});
+
+// ------------------------------------------------------------ hourly screen (setHourly)
+
+api.MapGet("/hourly/fields", () => Results.Ok(HourlyPush.Fields.Select(f => new { name = f.Name, source = f.Source })));
+
+api.MapPost("/hourly/preview", (HourlyPreviewReq req) =>
+{
+    if (!DateTime.TryParseExact(req.Date, "yyyy-MM-dd", null, System.Globalization.DateTimeStyles.None, out var date))
+        return Results.BadRequest(new { error = "Date must be yyyy-MM-dd." });
+    if (req.Hour is < 0 or > 23) return Results.BadRequest(new { error = "Hour must be 0 to 23." });
+    var job = Runner.StartHourlyPreview(connStr, date, req.Hour, req.Limit is > 0 ? req.Limit : null, req.IgnoreLog, req.Auto, out var error);
+    return job == null ? Results.Conflict(new { error }) : Results.Ok(new { jobId = job.Id });
+});
+
+api.MapGet("/hourly/plans/{id}", (string id) =>
+{
+    if (!Runner.HPlans.TryGetValue(id, out var sp)) return Results.NotFound(new { error = "This preview has expired. Run Preview again." });
+    var p = sp.Plan;
+    return Results.Ok(new
+    {
+        planId = sp.Id, label = p.Label, date = p.Date.ToString("yyyy-MM-dd"), hour = p.Hour, endpoint = p.Endpoint, created = sp.Created, sent = sp.Sent,
+        toSend = p.ToSend.Count, alreadySent = p.Items.Count(i => i.Done), eligible = p.Items.Count, skipped = p.Skips.Count, procRows = p.ProcRows,
+        limit = p.Limit, ignoreLog = p.IgnoreLog, logReady = p.LogReady,
+        skippedBreakdown = p.Skips.GroupBy(s => HourlySkipLabel(s.Why)).OrderByDescending(g => g.Count()).Select(g => new { reason = g.Key, count = g.Count() })
+    });
+});
+
+api.MapGet("/hourly/plans/{id}/records", (string id, int? skip, int? take, string? q, string? which) =>
+{
+    if (!Runner.HPlans.TryGetValue(id, out var sp)) return Results.NotFound(new { error = "This preview has expired. Run Preview again." });
+    var source = which == "done" ? sp.Plan.Items.Where(i => i.Done && !sp.Plan.ToSend.Contains(i)) : sp.Plan.ToSend;
+    var rows = source.Where(i => Matches(q, i.ServiceNo, i.Unique, HV(i, "meterno"))).ToList();
+    return Results.Ok(new
+    {
+        total = rows.Count,
+        rows = rows.Skip(skip ?? 0).Take(Math.Clamp(take ?? 50, 1, 500)).Select(i => new
+        {
+            serviceNo = i.ServiceNo, unique = i.Unique, meterNo = HV(i, "meterno"), readAt = i.ReadAt, kwh = HV(i, "reading_kwh"), kvah = HV(i, "reading_kvah"),
+            rmdKw = HV(i, "rmd_kw"), rmdKva = HV(i, "rmd_kva"), pf = HV(i, "pf"), alreadySent = i.Done
+        })
+    });
+});
+
+api.MapGet("/hourly/plans/{id}/records/{serviceNo}", (string id, string serviceNo) =>
+{
+    if (!Runner.HPlans.TryGetValue(id, out var sp)) return Results.NotFound(new { error = "This preview has expired. Run Preview again." });
+    var it = sp.Plan.Items.FirstOrDefault(i => i.ServiceNo == serviceNo);
+    if (it == null) return Results.NotFound(new { error = "Not in this preview." });
+    return Results.Ok(new
+    {
+        serviceNo = it.ServiceNo, readAt = it.ReadAt,
+        values = HourlyPush.Fields.Select(f => new { name = f.Name, sent = f.Name == "password" ? "********" : it.Values.GetValueOrDefault(f.Name) ?? "" }),
+        xml = MonthlyPush.MaskPassword(it.Xml)
+    });
+});
+
+api.MapGet("/hourly/plans/{id}/skipped", (string id, int? skip, int? take, string? q) =>
+{
+    if (!Runner.HPlans.TryGetValue(id, out var sp)) return Results.NotFound(new { error = "This preview has expired. Run Preview again." });
+    var rows = sp.Plan.Skips.Where(s => Matches(q, s.ServiceNo, s.Unique, s.Why)).ToList();
+    return Results.Ok(new
+    {
+        total = rows.Count,
+        rows = rows.Skip(skip ?? 0).Take(Math.Clamp(take ?? 50, 1, 500)).Select(s => new { serviceNo = s.ServiceNo, unique = s.Unique, category = HourlySkipLabel(s.Why), reason = s.Why })
+    });
+});
+
+api.MapGet("/hourly/plans/{id}/download/{what}", (string id, string what) =>
+{
+    if (!Runner.HPlans.TryGetValue(id, out var sp)) return Results.NotFound(new { error = "This preview has expired. Run Preview again." });
+    var p = sp.Plan;
+    if (what == "xlsx")
+    {
+        // one workbook with everything the preview shows: what will be sent, what was sent before, what was skipped
+        string[] Head() => new[] { "service_no", "reading_at (Date & Time)" }.Concat(HourlyPush.Fields.Select(f => f.Name)).ToArray();
+        string[] Row(HourlyPush.HItem it) => new[] { it.ServiceNo, it.ReadAt }
+            .Concat(HourlyPush.Fields.Select(f => f.Name == "password" ? "********" : it.Values.GetValueOrDefault(f.Name) ?? "")).ToArray();
+        var send = new List<string[]> { Head() }; send.AddRange(p.ToSend.Select(Row));
+        var done = new List<string[]> { Head() }; done.AddRange(p.Items.Where(i => i.Done && !p.ToSend.Contains(i)).Select(Row));
+        var skipped = new List<string[]> { new[] { "service_no", "unique_service_no", "why", "details" } };
+        skipped.AddRange(p.Skips.Select(s => new[] { s.ServiceNo, s.Unique ?? "", HourlySkipLabel(s.Why), s.Why }));
+        var book = XlsxWriter.Build(new[] { ("To send", send), ("Already sent", done), ("Skipped", skipped) });
+        return Results.File(book, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", $"hourly_preview_{p.Date:yyyy-MM-dd}_{p.Hour:00}.xlsx");
+    }
+    var sb = new StringBuilder();
+    if (what is "records" or "done")
+    {
+        sb.AppendLine("service_no," + string.Join(",", HourlyPush.Fields.Select(f => Csv(f.Name))));
+        foreach (var it in what == "done" ? p.Items.Where(i => i.Done && !p.ToSend.Contains(i)) : p.ToSend)
+            sb.AppendLine(Csv(it.ServiceNo) + "," + string.Join(",", HourlyPush.Fields.Select(f => Csv(f.Name == "password" ? "********" : it.Values.GetValueOrDefault(f.Name) ?? ""))));
+    }
+    else if (what == "skipped")
+    {
+        sb.AppendLine("service_no,unique_service_no,reason");
+        foreach (var s in p.Skips) sb.AppendLine(string.Join(",", new[] { s.ServiceNo, s.Unique ?? "", s.Why }.Select(Csv)));
+    }
+    else return Results.NotFound();
+    var bytes = new UTF8Encoding(true).GetPreamble().Concat(Encoding.UTF8.GetBytes(sb.ToString())).ToArray();
+    return Results.File(bytes, "text/csv", $"hourly_{what}_{p.Date:yyyy-MM-dd}_{p.Hour:00}.csv");
+});
+
+api.MapPost("/hourly/plans/{id}/send", (string id, SendReq req) =>
+{
+    if (!Runner.HPlans.TryGetValue(id, out var sp)) return Results.NotFound(new { error = "This preview has expired. Run Preview again." });
+    if (sp.Plan.ToSend.Count == 0) return Results.BadRequest(new { error = "Nothing to send." });
+    if (!sp.Plan.LogReady) return Results.BadRequest(new { error = "Cannot send: dbo.PushLog_Hourly does not exist. Run sql\\05_create_PushLog_Hourly.sql in SQL Server first." });
+    if (req.ConfirmCount != sp.Plan.ToSend.Count) return Results.BadRequest(new { error = "The confirmed count does not match the preview." });
+    lock (sp)
+    {
+        if (sp.Sent) return Results.Conflict(new { error = "This preview was already sent. Run Preview again to see what is left." });
+        var job = Runner.StartHourlySend(connStr, sp, out var error);
+        if (job == null) return Results.Conflict(new { error });
+        sp.Sent = true;
+        return Results.Ok(new { jobId = job.Id });
+    }
+});
+
+// what was sent before: one list per (reading date, hour)
+api.MapGet("/hourly/history/slots", () =>
+{
+    using var db = new SqlConnection(connStr); db.Open();
+    var list = new List<object>();
+    using var cmd = new SqlCommand(@"SELECT TOP 100 ReadingDate, ReadingHour FROM dbo.PushLog_Hourly GROUP BY ReadingDate, ReadingHour ORDER BY ReadingDate DESC, ReadingHour DESC", db);
+    try
+    {
+        using var r = cmd.ExecuteReader();
+        while (r.Read()) list.Add(new { date = r.GetDateTime(0).ToString("yyyy-MM-dd"), hour = (int)r.GetByte(1) });
+    }
+    catch (SqlException) { } // table not created yet
+    return Results.Ok(list);
+});
+
+api.MapGet("/hourly/history", (string date, int hour, string? status, string? q, int? take) =>
+{
+    if (!DateTime.TryParseExact(date, "yyyy-MM-dd", null, System.Globalization.DateTimeStyles.None, out var d))
+        return Results.BadRequest(new { error = "date must be yyyy-MM-dd" });
+    using var db = new SqlConnection(connStr); db.Open();
+    var counts = new Dictionary<string, int>();
+    var rows = new List<object>();
+    using (var c = new SqlCommand("SELECT Status, COUNT(*) FROM dbo.PushLog_Hourly WHERE ReadingDate=@d AND ReadingHour=@h GROUP BY Status", db))
+    {
+        c.Parameters.AddWithValue("@d", d); c.Parameters.AddWithValue("@h", (byte)hour);
+        using var r = c.ExecuteReader();
+        while (r.Read()) counts[r.GetString(0)] = r.GetInt32(1);
+    }
+    using (var c = new SqlCommand(@"
+SELECT TOP (@take) ServiceNo, UniqueServiceNo, MeterNo, ReadAt, Status, Detail, PushedOn, RequestXml
+FROM dbo.PushLog_Hourly
+WHERE ReadingDate=@d AND ReadingHour=@h
+  AND (@status IS NULL OR Status=@status)
+  AND (@q IS NULL OR ServiceNo LIKE @like OR UniqueServiceNo LIKE @like OR MeterNo LIKE @like OR Detail LIKE @like)
+ORDER BY PushedOn DESC, ServiceNo", db))
+    {
+        c.Parameters.AddWithValue("@take", Math.Clamp(take ?? 300, 1, 2000));
+        c.Parameters.AddWithValue("@d", d); c.Parameters.AddWithValue("@h", (byte)hour);
+        c.Parameters.AddWithValue("@status", string.IsNullOrEmpty(status) ? DBNull.Value : status);
+        c.Parameters.AddWithValue("@q", string.IsNullOrWhiteSpace(q) ? DBNull.Value : q.Trim());
+        c.Parameters.AddWithValue("@like", "%" + (q ?? "").Trim() + "%");
+        using var r = c.ExecuteReader();
+        while (r.Read())
+        {
+            var detail = r.IsDBNull(5) ? "" : r.GetString(5);
+            rows.Add(new
+            {
+                serviceNo = r.GetString(0), unique = r.IsDBNull(1) ? null : r.GetString(1), meterNo = r.IsDBNull(2) ? null : r.GetString(2),
+                readAt = r.IsDBNull(3) ? null : r.GetString(3), status = r.GetString(4), reply = detail, meaning = ReplyMeaning(detail),
+                pushedOn = r.GetDateTime(6), xml = r.IsDBNull(7) ? null : r.GetString(7)
+            });
+        }
+    }
+    return Results.Ok(new { counts, rows });
 });
 
 // ------------------------------------------------------------ history screen
@@ -321,6 +493,20 @@ static string SkipLabel(string why)
     return "Other";
 }
 
+static string? HV(HourlyPush.HItem i, string name) => i.Values.TryGetValue(name, out var v) ? v : null;
+
+static string HourlySkipLabel(string why)
+{
+    var w = why.ToLowerInvariant();
+    if (w.StartsWith("latest reading is at")) return "Latest reading is not at the chosen hour";
+    if (w.StartsWith("no reading for")) return "No reading for the day";
+    if (w.StartsWith("no value in the reading")) return "Value missing in the reading";
+    if (w.StartsWith("no date & time")) return "No Date & Time in the reading";
+    if (w.StartsWith("no valid 9-digit")) return "No valid unique service number";
+    if (w.StartsWith("service not found")) return "Service not in ServiceDetails";
+    return "Other";
+}
+
 static FailRow[] FailuresOf(Job j) { lock (j.Failures) return j.Failures.ToArray(); }
 
 static string ReplyMeaning(string reply)
@@ -333,4 +519,5 @@ static string ReplyMeaning(string reply)
 }
 
 record PreviewReq(string Date, int? Limit, bool IgnoreLog, bool Auto = false);
+record HourlyPreviewReq(string Date, int Hour, int? Limit, bool IgnoreLog, bool Auto = false);
 record SendReq(int ConfirmCount);

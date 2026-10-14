@@ -178,9 +178,79 @@
   <!-- ============================== HOURLY ============================== -->
   <section id="hourly" class="hidden">
     <div class="card">
-      <h2>Hourly push (setHourly)</h2>
-      <div class="msg warn" style="margin-top:0"><b>Not connected yet.</b> The fields below come from the request that works with the vendor. Next step: for each field, say which table / column (or fixed value) it is taken from. Preview and Send for hourly are added after that, and nothing is sent from this tab for now.</div>
-      <p class="muted small" style="margin:8px 0 12px">Sample values are from the working test request. <code>username</code> and <code>password</code> are added from the settings.</p>
+      <h2>1. Choose what to push (setHourly)</h2>
+      <div class="row" style="margin-bottom:14px">
+        <div>
+          <label>Mode</label>
+          <div class="row" style="gap:20px">
+            <label class="check"><input type="radio" name="hmode" value="manual" checked> Manual - preview first, then I check and press Send</label>
+            <label class="check"><input type="radio" name="hmode" value="auto"> Automatic - preview and send straight away</label>
+          </div>
+        </div>
+      </div>
+      <div class="row">
+        <div><label for="hrDate">Reading date</label><input type="date" id="hrDate"></div>
+        <div><label for="hrHour">Hour</label><select id="hrHour"></select></div>
+        <div><label for="hrLimit">Test with only this many meters (optional)</label><input type="number" id="hrLimit" min="1" placeholder="all" style="width:130px"></div>
+        <label class="check"><input type="checkbox" id="hrIgnore"> Also resend meters already sent for this hour</label>
+        <button class="primary" id="hrPreview">Preview</button>
+      </div>
+      <p class="muted small" style="margin:10px 0 0" id="hrNote"></p>
+      <p class="muted small" style="margin:6px 0 0">The date and hour start as the current date and hour. <code>reading_time</code> is sent as the hour (for example 12:00:00). Only meters whose latest reading of that day is exactly at that hour (for example 11:00, not 11:30) are sent; the others are listed under Skipped. Reading all meters takes 1 to 7 minutes.</p>
+      <div id="hrMsg"></div>
+    </div>
+
+    <div class="card hidden" id="hrProgressCard">
+      <h2 id="hrProgressTitle">Working...</h2>
+      <div class="bar"><div id="hrBar"></div></div>
+      <p class="small" id="hrProgressText" style="margin:8px 0 0"></p>
+      <div class="actions" style="justify-content:flex-start"><button class="danger hidden" id="hrStop">Stop</button></div>
+      <details><summary class="small muted" style="cursor:pointer;margin-top:8px">Show log</summary><pre id="hrLog"></pre></details>
+    </div>
+
+    <div class="card hidden" id="hrPlanCard">
+      <h2>2. Check the preview <span class="muted small" id="hrPlanTitle"></span></h2>
+      <div class="stats">
+        <div class="stat ok"><b id="hrStSend">0</b><span>will be sent</span></div>
+        <div class="stat"><b id="hrStDone">0</b><span>already sent this hour</span></div>
+        <div class="stat warn"><b id="hrStSkip">0</b><span>skipped (not sent)</span></div>
+      </div>
+      <div id="hrBreakdown" class="small" style="margin:12px 0 0"></div>
+      <div class="tabs"><button id="hrTabSend" class="on">To send</button><button id="hrTabDone">Already sent</button><button id="hrTabSkip">Skipped</button></div>
+      <div class="row" style="margin-bottom:8px">
+        <div><input type="text" id="hrSearch" placeholder="Search service / meter..." style="width:260px"></div>
+        <button class="secondary" id="hrDl">Download this tab (CSV)</button>
+        <button class="primary" id="hrDlX">Download Excel (.xlsx) - to send, already sent, skipped</button>
+      </div>
+      <div class="scroll"><table id="hrTable"></table></div>
+      <div class="row small" style="margin-top:8px"><button class="secondary" id="hrPrev">Previous</button><button class="secondary" id="hrNext">Next</button><span class="muted" id="hrPageInfo"></span></div>
+      <div class="actions" style="justify-content:flex-start;margin-top:20px;border-top:1px solid var(--line);padding-top:16px">
+        <button class="primary" id="hrSend">Send to vendor API</button>
+        <span class="muted small" id="hrSendHint"></span>
+      </div>
+    </div>
+
+    <div class="card hidden" id="hrResultCard">
+      <h2>3. Result</h2>
+      <div id="hrResultBody"></div>
+    </div>
+
+    <div class="card">
+      <h2>Hourly history</h2>
+      <div class="row">
+        <div><label for="hhSlot">Date and hour</label><select id="hhSlot" style="min-width:190px"></select></div>
+        <div><label for="hhStatus">Outcome</label><select id="hhStatus"><option value="">All</option><option value="OK">Sent (OK)</option><option value="FAILED">Failed</option></select></div>
+        <div><label for="hhSearch">Search</label><input type="text" id="hhSearch" placeholder="service, unique no, meter, reply" style="width:240px"></div>
+        <button class="primary" id="hhGo">Show</button>
+      </div>
+      <div class="stats" id="hhStats" style="margin-top:14px"></div>
+      <div class="scroll" style="margin-top:12px"><table id="hhTable"></table></div>
+      <p class="muted small" id="hhNote">Nothing sent yet from this tab (or the table dbo.PushLog_Hourly is not created yet).</p>
+    </div>
+
+    <div class="card">
+      <h2>Where each value comes from</h2>
+      <p class="muted small" style="margin:0 0 10px">The "procedure" is dbo.PrBLSTotalDCWiseMeterDataInstantDay, called for the reading date. <code>username</code> and <code>password</code> come from the settings.</p>
       <div class="scroll" style="max-height:none"><table id="hourlyTable"></table></div>
     </div>
   </section>
@@ -240,25 +310,197 @@ function askCode(wrong) {
 const showMsg = (kind, text) => { $('runMsg').innerHTML = text ? `<div class="msg ${kind}">${esc(text)}</div>` : ''; };
 
 // ---------- navigation
-$('navRun').onclick = () => nav('run'); $('navHist').onclick = () => { nav('hist'); loadDates(); }; $('navHourly').onclick = () => nav('hourly');
+$('navRun').onclick = () => nav('run'); $('navHist').onclick = () => { nav('hist'); loadDates(); }; $('navHourly').onclick = () => { nav('hourly'); loadHSlots(); loadHFields(); };
 function nav(w) {
   $('run').classList.toggle('hidden', w !== 'run'); $('hist').classList.toggle('hidden', w !== 'hist'); $('hourly').classList.toggle('hidden', w !== 'hourly');
   $('navRun').classList.toggle('on', w === 'run'); $('navHist').classList.toggle('on', w === 'hist'); $('navHourly').classList.toggle('on', w === 'hourly');
   $('apiName').textContent = 'Vendor API: ' + (w === 'hourly' ? 'setHourly' : 'setMonthly');
 }
 
-// ---------- hourly: the setHourly fields (sample values from the request that works); sources are filled in later
-const HOURLY_SAMPLE = [
-  ['vendor_code', '0'], ['reading_date', '01/10/26'], ['reading_time', '12:30:00'], ['unique_scno', '030102233'], ['reading_kvah', '10719'],
-  ['reading_kwh', '8932.13'], ['kwh_status', '0'], ['kvah_status', '0'], ['rmd_kw', '1.32'], ['rmd_kva', '0.02'], ['phase', '1'],
-  ['meterno', 'A05356'], ['metermake', 'ECIL'], ['mf', '1'], ['pf', '1'], ['deducted_amt', '0'], ['balance_amt', '0'],
-  ['old_reading_kvah', '10545'], ['old_reading_kwh', '8769'], ['new_reading_kvah', '10719'], ['new_reading_kwh', '8932.13'], ['new_meter_mf', '0'],
-  ['r_vol', '0'], ['y_vol', '0'], ['b_vol', '0'], ['r_cur', '0'], ['y_cur', '0'], ['b_cur', '0'], ['vol_cur_miss_flag', 'Y'],
-  ['consumed_units', '163'], ['relay_status', '0'], ['opn_rdg', '0'], ['opn_balance', '0'], ['slab_rate', '0'], ['crje', '0'], ['drje', '0'],
-  ['echgs', '0'], ['fchgs', '0'], ['cchgs', '0'], ['edchgs', '0'], ['mphase', '1'], ['scno', '030102233']
-];
-$('hourlyTable').innerHTML = '<tr><th>#</th><th>Field</th><th>Sample value</th><th>Taken from</th></tr>' +
-  HOURLY_SAMPLE.map((f, i) => `<tr><td class="muted">${i + 1}</td><td><code>${esc(f[0])}</code></td><td>${esc(f[1])}</td><td class="muted">to be defined</td></tr>`).join('');
+// ---------- hourly (setHourly)
+const SOURCE_TEXT = src => src === 'date' ? 'current date (dd/MM/yy)' : src === 'time' ? 'the chosen hour, as HH:00:00 (matches the procedure column Date & Time)'
+  : src === 'svc:unique' ? 'ServiceDetails.UniqueServiceNo (same as setMonthly)' : src === 'svc:compact' ? 'Service No without the space (same as setMonthly)'
+  : src.startsWith('proc:') ? 'procedure column "' + src.slice(5) + '"' : src.startsWith('setting:') ? 'setting ' + src.slice(8) : 'fixed value ' + src;
+
+let hFieldsLoaded = false;
+async function loadHFields() {
+  if (hFieldsLoaded) return;
+  try {
+    const f = await api('/hourly/fields');
+    $('hourlyTable').innerHTML = '<tr><th>#</th><th>Field</th><th>Taken from</th></tr>' +
+      f.map((x, i) => `<tr><td class="muted">${i + 1}</td><td><code>${esc(x.name)}</code></td><td>${esc(SOURCE_TEXT(x.source))}</td></tr>`).join('');
+    hFieldsLoaded = true;
+  } catch (e) { $('hourlyTable').innerHTML = '<tr><td class="muted">Could not load: ' + esc(e.message) + '</td></tr>'; }
+}
+
+let hPlan = null, hView = 'send', hPage = 0, hJobId = null, hNext = 0, hTimer = null, hStart = 0;
+const hMsg = (kind, text) => { $('hrMsg').innerHTML = text ? `<div class="msg ${kind}">${esc(text)}</div>` : ''; };
+$('hrDate').value = new Date().toLocaleDateString('sv-SE');
+$('hrHour').innerHTML = Array.from({ length: 24 }, (_, h) => `<option value="${h}">${String(h).padStart(2, '0')}:00</option>`).join('');
+$('hrHour').value = new Date().getHours();
+const isHAuto = () => document.querySelector('input[name=hmode]:checked').value === 'auto';
+function applyHMode() {
+  const auto = isHAuto();
+  $('hrPreview').textContent = auto ? 'Run now (preview + send)' : 'Preview';
+  $('hrNote').innerHTML = auto
+    ? '<b>Automatic:</b> reads the meter data and then sends to the vendor straight away, with no review step. Meters already sent for this hour are not sent again unless you tick "also resend".'
+    : 'Preview only reads the meter data and shows what would be sent. Nothing goes to the vendor until you press Send.';
+  try { localStorage.setItem('hourlyMode', auto ? 'auto' : 'manual'); } catch (e) {}
+}
+document.querySelectorAll('input[name=hmode]').forEach(r => r.onchange = applyHMode);
+try { if (localStorage.getItem('hourlyMode') === 'auto') document.querySelector('input[name=hmode][value=auto]').checked = true; } catch (e) {}
+applyHMode();
+
+$('hrPreview').onclick = async () => {
+  hMsg('', ''); $('hrPlanCard').classList.add('hidden'); $('hrResultCard').classList.add('hidden');
+  try {
+    const r = await api('/hourly/preview', { method: 'POST', body: JSON.stringify({
+      date: $('hrDate').value, hour: +$('hrHour').value, limit: $('hrLimit').value ? +$('hrLimit').value : null, ignoreLog: $('hrIgnore').checked, auto: isHAuto() }) });
+    startHPolling(r.jobId, isHAuto() ? 'Reading the meter data, then sending...' : 'Reading all the meter data (1 to 7 minutes)...');
+  } catch (e) { hMsg('bad', e.message); }
+};
+
+const hElapsed = () => { const s = Math.floor((Date.now() - hStart) / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+function startHPolling(id, title) {
+  hJobId = id; hNext = 0; $('hrLog').textContent = ''; hStart = Date.now();
+  $('hrProgressCard').classList.remove('hidden'); $('hrProgressTitle').textContent = title;
+  $('hrPreview').disabled = true; $('hrSend').disabled = true;
+  clearInterval(hTimer); hTimer = setInterval(hPoll, 1000); hPoll();
+}
+async function hPoll() {
+  let j;
+  try { j = await api(`/jobs/${hJobId}?from=${hNext}`); }
+  catch (e) { $('hrProgressText').textContent = 'Cannot reach the server (' + e.message + ') - retrying. Running for ' + hElapsed(); return; }
+  if (j.lines.length) {
+    const box = $('hrLog'); const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+    box.textContent += j.lines.join('\n') + '\n'; hNext = j.nextLine; if (atEnd) box.scrollTop = box.scrollHeight;
+  }
+  const isSend = j.kind === 'send';
+  $('hrStop').classList.toggle('hidden', !(isSend && j.state === 'Running'));
+  if (isSend) {
+    $('hrBar').style.width = (j.total ? Math.round(j.index / j.total * 100) : 0) + '%';
+    $('hrProgressTitle').textContent = j.state === 'Running' ? 'Sending to the vendor API...' : 'Finished';
+    $('hrProgressText').textContent = `${j.index} of ${j.total} sent - accepted ${j.pushed}, failed ${j.failed}`;
+  } else {
+    $('hrBar').style.width = j.state === 'Running' ? '40%' : '100%';
+    $('hrProgressText').textContent = j.state === 'Running' ? `Running for ${hElapsed()}. Reading the meter data can take 1 to 7 minutes - please wait.` : '';
+  }
+  if (j.state === 'Running') return;
+  clearInterval(hTimer); $('hrPreview').disabled = false; loadHSlots();
+  if (j.state === 'Failed') { hMsg('bad', 'Failed: ' + j.error); $('hrProgressCard').classList.add('hidden'); return; }
+  if (isSend) showHResult(j); else { $('hrProgressCard').classList.add('hidden'); loadHPlan(j.planId); }
+}
+
+async function loadHPlan(id) {
+  try { hPlan = await api('/hourly/plans/' + id); } catch (e) { hMsg('bad', e.message); return; }
+  $('hrPlanCard').classList.remove('hidden');
+  $('hrPlanTitle').textContent = '- reading ' + hPlan.label + (hPlan.limit ? ` - test limit ${hPlan.limit}` : '') + (hPlan.ignoreLog ? ' - resending already sent meters' : '');
+  $('hrStSend').textContent = hPlan.toSend; $('hrStDone').textContent = hPlan.alreadySent; $('hrStSkip').textContent = hPlan.skipped;
+  $('hrBreakdown').innerHTML = `<div class="muted small" style="margin-bottom:6px">The procedure returned ${hPlan.procRows} meter(s) for the day; ${hPlan.eligible} of them have their latest reading exactly at ${String(hPlan.hour).padStart(2, '0')}:00 and passed the checks.</div>`
+    + (hPlan.skippedBreakdown.length ? '<b>Why meters are skipped:</b> ' + hPlan.skippedBreakdown.map(b => `${esc(b.reason)} (${b.count})`).join(' &middot; ') : '')
+    + (hPlan.logReady ? '' : '<div class="msg warn">The table dbo.PushLog_Hourly does not exist yet, so Send is disabled. Run sql\\05_create_PushLog_Hourly.sql in SQL Server first, then Preview again.</div>');
+  $('hrSend').disabled = hPlan.toSend === 0 || hPlan.sent || !hPlan.logReady;
+  $('hrSendHint').textContent = hPlan.toSend === 0 ? 'Nothing to send for this hour.' : `Sends ${hPlan.toSend} record(s) one by one, then shows the result.`;
+  $('hrSearch').value = ''; hPage = 0;
+  hView = hPlan.toSend > 0 ? 'send' : hPlan.alreadySent > 0 ? 'done' : hPlan.skipped > 0 ? 'skip' : 'send';
+  setHTabs(); loadHRows();
+}
+function setHTabs() { $('hrTabSend').classList.toggle('on', hView === 'send'); $('hrTabDone').classList.toggle('on', hView === 'done'); $('hrTabSkip').classList.toggle('on', hView === 'skip'); }
+$('hrTabSend').onclick = () => { hView = 'send'; hPage = 0; setHTabs(); loadHRows(); };
+$('hrTabDone').onclick = () => { hView = 'done'; hPage = 0; setHTabs(); loadHRows(); };
+$('hrTabSkip').onclick = () => { hView = 'skip'; hPage = 0; setHTabs(); loadHRows(); };
+let hst; $('hrSearch').oninput = () => { clearTimeout(hst); hst = setTimeout(() => { hPage = 0; loadHRows(); }, 300); };
+$('hrPrev').onclick = () => { if (hPage > 0) { hPage--; loadHRows(); } };
+$('hrNext').onclick = () => { hPage++; loadHRows(); };
+
+async function loadHRows() {
+  const q = encodeURIComponent($('hrSearch').value);
+  const d = await api(`/hourly/plans/${hPlan.planId}/${hView === 'skip' ? 'skipped' : 'records'}?skip=${hPage * PAGE}&take=${PAGE}&q=${q}${hView === 'done' ? '&which=done' : ''}`);
+  const t = $('hrTable');
+  if (hView !== 'skip') {
+    t.innerHTML = '<tr><th>Service no</th><th>Unique no</th><th>Meter</th><th>Reading at</th><th>kWh</th><th>kVAh</th><th>MD kW</th><th>MD kVA</th><th>PF</th><th></th></tr>' +
+      d.rows.map(r => `<tr class="click" data-s="${esc(r.serviceNo)}"><td>${esc(r.serviceNo)}</td><td>${esc(r.unique)}</td><td>${esc(r.meterNo)}</td><td>${esc(r.readAt)}</td><td>${esc(r.kwh)}</td><td>${esc(r.kvah)}</td><td>${esc(r.rmdKw)}</td><td>${esc(r.rmdKva)}</td><td>${esc(r.pf)}</td><td>${r.alreadySent ? '<span class="pill OK">sent before</span>' : ''}</td></tr>`).join('');
+    t.querySelectorAll('tr.click').forEach(tr => tr.onclick = () => showHPlanDetail(tr.dataset.s));
+  } else {
+    t.innerHTML = '<tr><th>Service no</th><th>Unique no</th><th>Why skipped</th><th>Details</th></tr>' +
+      d.rows.map(r => `<tr><td>${esc(r.serviceNo)}</td><td>${esc(r.unique)}</td><td>${esc(r.category)}</td><td class="wrap muted">${esc(r.reason)}</td></tr>`).join('');
+  }
+  const from = d.total ? hPage * PAGE + 1 : 0, to = Math.min((hPage + 1) * PAGE, d.total);
+  $('hrPageInfo').textContent = `${from}-${to} of ${d.total}`;
+  $('hrPrev').disabled = hPage === 0; $('hrNext').disabled = to >= d.total;
+}
+async function showHPlanDetail(serviceNo) {
+  const d = await api(`/hourly/plans/${hPlan.planId}/records/${encodeURIComponent(serviceNo)}`);
+  $('detailTitle').textContent = 'Service ' + serviceNo + ' - what will be sent';
+  $('detailBody').innerHTML = `<p class="small muted">Meter reading taken at <b>${esc(d.readAt)}</b>.</p>` + kv(d.values.map(v => [v.name, v.sent])) +
+    `<details><summary class="small muted" style="cursor:pointer;margin-top:10px">Show the XML request</summary><pre>${esc(d.xml)}</pre></details>`;
+  $('detailModal').classList.remove('hidden');
+}
+$('hrDl').onclick = async () => {
+  const what = hView === 'skip' ? 'skipped' : hView === 'done' ? 'done' : 'records';
+  const res = await api(`/hourly/plans/${hPlan.planId}/download/${what}`, { raw: true });
+  const blob = await res.blob(); const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = `hourly_${what}_${hPlan.date}_${String(hPlan.hour).padStart(2, '0')}.csv`; a.click();
+};
+
+$('hrDlX').onclick = async () => {
+  const res = await api(`/hourly/plans/${hPlan.planId}/download/xlsx`, { raw: true });
+  const blob = await res.blob(); const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = `hourly_preview_${hPlan.date}_${String(hPlan.hour).padStart(2, '0')}.xlsx`; a.click();
+};
+
+$('hrSend').onclick = () => {
+  $('confirmText').innerHTML = `Send <b>${hPlan.toSend}</b> hourly record(s) for <b>${esc(hPlan.label)}</b> to<br><span class="small muted">${esc(hPlan.endpoint)}</span>`;
+  confirmAction = async () => {
+    try {
+      const r = await api(`/hourly/plans/${hPlan.planId}/send`, { method: 'POST', body: JSON.stringify({ confirmCount: hPlan.toSend }) });
+      $('hrPlanCard').classList.add('hidden'); startHPolling(r.jobId, 'Sending to the vendor API...');
+    } catch (e) { hMsg('bad', e.message); }
+  };
+  $('confirmModal').classList.remove('hidden');
+};
+$('hrStop').onclick = async () => { $('hrStop').disabled = true; await api(`/jobs/${hJobId}/stop`, { method: 'POST' }); };
+
+function showHResult(j) {
+  $('hrProgressCard').classList.add('hidden'); $('hrResultCard').classList.remove('hidden');
+  const bad = j.failed > 0 || j.stoppedBecause;
+  $('hrResultBody').innerHTML =
+    `<div class="msg ${bad ? 'warn' : 'ok'}">${j.stoppedBecause ? 'Stopped: ' + esc(j.stoppedBecause) + '. ' : ''}Accepted <b>${j.pushed}</b>, failed <b>${j.failed}</b>, of ${j.total} planned. Run Preview again to see what is left; failed meters are retried automatically.</div>` +
+    (j.replies.length ? '<div class="scroll"><table><tr><th>API reply</th><th>Meaning</th><th>Meters</th></tr>' + j.replies.map(r => `<tr><td>${esc(r.reply)}</td><td>${esc(r.meaning)}</td><td>${r.count}</td></tr>`).join('') + '</table></div>' : '') +
+    (j.failures && j.failures.length
+      ? '<h3 style="margin:16px 0 6px;font-size:15px">Why meters failed</h3><div class="scroll"><table><tr><th>Service no</th><th>Unique no</th><th>API reply</th><th>What it usually means</th></tr>' +
+        j.failures.map(f => `<tr><td>${esc(f.serviceNo)}</td><td>${esc(f.ukscno)}</td><td>${esc(f.reply)}</td><td class="wrap">${esc(failHint(f))}</td></tr>`).join('') + '</table></div>' : '') +
+    '<details open style="margin-top:12px"><summary class="small muted" style="cursor:pointer">Show log</summary><pre>' + esc($('hrLog').textContent) + '</pre></details>' +
+    '<p class="small muted">Every record and the reply is saved - see Hourly history below (click a row to see the full request).</p>';
+}
+
+// hourly history
+async function loadHSlots() {
+  let slots = [];
+  try { slots = await api('/hourly/history/slots'); } catch (e) { return; }
+  const keep = $('hhSlot').value;
+  $('hhSlot').innerHTML = slots.map(s => `<option value="${s.date}|${s.hour}">${s.date} ${String(s.hour).padStart(2, '0')}:00</option>`).join('');
+  if (keep && [...$('hhSlot').options].some(o => o.value === keep)) $('hhSlot').value = keep;
+  if (slots.length) loadHHistory(); else { $('hhStats').innerHTML = ''; $('hhTable').innerHTML = ''; }
+}
+$('hhGo').onclick = loadHHistory;
+$('hhSearch').onkeydown = e => { if (e.key === 'Enter') loadHHistory(); };
+async function loadHHistory() {
+  const v = $('hhSlot').value; if (!v) return;
+  const [date, hour] = v.split('|');
+  const d = await api(`/hourly/history?date=${date}&hour=${hour}&status=${$('hhStatus').value}&q=${encodeURIComponent($('hhSearch').value)}&take=300`);
+  const c = d.counts;
+  $('hhStats').innerHTML = `<div class="stat ok"><b>${c.OK || 0}</b><span>sent (OK)</span></div><div class="stat bad"><b>${c.FAILED || 0}</b><span>failed</span></div>`;
+  $('hhTable').innerHTML = '<tr><th>Service no</th><th>Unique no</th><th>Meter</th><th>Reading at</th><th>Outcome</th><th>Meaning</th><th>API reply</th><th>When</th></tr>' +
+    d.rows.map((r, i) => `<tr class="click" data-i="${i}"><td>${esc(r.serviceNo)}</td><td>${esc(r.unique)}</td><td>${esc(r.meterNo)}</td><td>${esc(r.readAt)}</td><td><span class="pill ${r.status}">${esc(r.status)}</span></td><td>${esc(r.meaning)}</td><td class="wrap muted">${esc(r.reply)}</td><td>${esc((r.pushedOn || '').replace('T', ' ').slice(0, 19))}</td></tr>`).join('');
+  $('hhTable').querySelectorAll('tr.click').forEach(tr => tr.onclick = () => {
+    const r = d.rows[+tr.dataset.i];
+    $('detailTitle').textContent = 'Service ' + r.serviceNo + ' - ' + date + ' ' + String(hour).padStart(2, '0') + ':00';
+    $('detailBody').innerHTML = `<p class="small"><span class="pill ${esc(r.status)}">${esc(r.status)}</span> &nbsp; ${esc(r.reply)}</p>` + (r.xml ? `<pre>${esc(r.xml)}</pre>` : '');
+    $('detailModal').classList.remove('hidden');
+  });
+  $('hhNote').textContent = `Showing the latest ${d.rows.length} row(s) (max 300).`;
+}
 
 // ---------- run: preview
 function firstOfMonth() { const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1).toLocaleDateString('sv-SE'); }
@@ -427,18 +669,19 @@ $('btnDl').onclick = async () => {
 };
 
 // ---------- run: send
+let confirmAction = null; // what "Yes, send" does (monthly or hourly)
 $('btnSend').onclick = () => {
   $('confirmText').innerHTML = `Send <b>${plan.toSend}</b> record(s) for push date <b>${esc(plan.pushDate)}</b> to<br><span class="small muted">${esc(plan.endpoint)}</span>`;
+  confirmAction = async () => {
+    try {
+      const r = await api(`/plans/${plan.planId}/send`, { method: 'POST', body: JSON.stringify({ confirmCount: plan.toSend }) });
+      $('planCard').classList.add('hidden'); startPolling(r.jobId, 'Sending to the vendor API...');
+    } catch (e) { showMsg('bad', e.message); }
+  };
   $('confirmModal').classList.remove('hidden');
 };
 $('confirmNo').onclick = () => $('confirmModal').classList.add('hidden');
-$('confirmYes').onclick = async () => {
-  $('confirmModal').classList.add('hidden');
-  try {
-    const r = await api(`/plans/${plan.planId}/send`, { method: 'POST', body: JSON.stringify({ confirmCount: plan.toSend }) });
-    $('planCard').classList.add('hidden'); startPolling(r.jobId, 'Sending to the vendor API...');
-  } catch (e) { showMsg('bad', e.message); }
-};
+$('confirmYes').onclick = () => { $('confirmModal').classList.add('hidden'); if (confirmAction) confirmAction(); };
 $('btnStop').onclick = async () => { $('btnStop').disabled = true; await api(`/jobs/${jobId}/stop`, { method: 'POST' }); };
 
 function failHint(f) {
@@ -502,7 +745,8 @@ $('hRetry').onclick = () => { $('date').value = $('hDate').value; $('ignoreLog')
   if (!code) await askCode(false);
   try {
     const a = await api('/jobs/active');
-    if (a.jobId) { nav('run'); startPolling(a.jobId, a.kind === 'send' ? 'Sending to the vendor API...' : 'Reading the meter data...'); }
+    if (a.jobId && a.op === 'hourly') { nav('hourly'); startHPolling(a.jobId, a.kind === 'send' ? 'Sending to the vendor API...' : 'Reading the meter data...'); }
+    else if (a.jobId) { nav('run'); startPolling(a.jobId, a.kind === 'send' ? 'Sending to the vendor API...' : 'Reading the meter data...'); }
   } catch (e) { showMsg('bad', e.message); }
 })();
 </script>

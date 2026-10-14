@@ -273,6 +273,10 @@ DELETE FROM dbo.PushLog_Monthly WHERE PushDate = '2026-10-01' AND ServiceNo = '0
 - **The reading time varies.** `date_time` is the time of each meter's latest reading that day, so it is different for each meter.
 - **Credentials:** the SQL Server password is stored as plain text in `appsettings.json`, and the SOAP password is in `dbo.PushConfig`. Restrict access to both.
 
-## 8. The hourly push (`setHourly`), draft only
+## 8. The hourly push (`setHourly`)
+
+**Web page (Hourly tab):** the final mapping is in `MeterPush/HourlyPush.cs` (`Fields`) and is also listed on the tab. One call of `dbo.PrBLSTotalDCWiseMeterDataInstantDay` for the reading date gives each meter's latest reading of the day. Only meters whose `Date & Time` is exactly the chosen hour (for example 11:00, not 11:30; default: the current hour) are sent, with `reading_time` = `HH:00:00`. Values come from the procedure columns `Meter Reading(kVAh)`, `Meter Reading(kWh)`, `MD kW`, `MD kVA`, `MSN`, `Power Factor`; `unique_scno` and `scno` are built as in setMonthly; everything else is a fixed value. Same Manual / Automatic modes, test limit, stop after 5 failures in a row. What was sent is kept in `dbo.PushLog_Hourly` (create it with `sql\05_create_PushLog_Hourly.sql`); a meter already sent OK for the same date and hour is not sent again unless "also resend" is ticked. The command-line app does not run this new hourly push yet.
+
+The text below describes the old first draft (console app only), which is replaced by the web page above.
 
 The hourly mapping is still the first draft. It lives in `dbo.PushConfig` (`Operation = 'setHourly'`): a stored `SOURCE_QUERY` on `dbo.PeriodicalDataLive`, plus one row per field, with a `LAST_ID` watermark. It will be replaced by a `PushConfig_Hourly` table once the final field mapping is decided. The API's quoting rules for text fields (as for `meter_no` above) have not been tested for it. Do not run it against the live API yet.

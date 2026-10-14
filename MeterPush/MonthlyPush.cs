@@ -760,7 +760,7 @@ VALUES (@d, @n, @u, @o, @r, @ok, @od, @md, @x{(vars.Count > 0 ? ", " + string.Jo
     }
 
     // One row per Service No (the procedure already keeps only the latest reading per service).
-    static Dictionary<string, Reading> CallProc(DateTime date, SqlConnection conn)
+    internal static Dictionary<string, Reading> CallProc(DateTime date, SqlConnection conn)
     {
         var result = new Dictionary<string, Reading>(StringComparer.Ordinal);
         using var cmd = new SqlCommand(Proc, conn) { CommandType = CommandType.StoredProcedure, CommandTimeout = 1200 };
