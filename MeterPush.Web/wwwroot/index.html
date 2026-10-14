@@ -100,10 +100,11 @@
       <div class="row">
         <div><label for="date">Push date</label><input type="date" id="date"></div>
         <div><label for="limit">Test with only this many meters (optional)</label><input type="number" id="limit" min="1" placeholder="all" style="width:130px"></div>
-        <label class="check"><input type="checkbox" id="ignoreLog"> Also resend meters already sent for this date</label>
+        <label class="check"><input type="checkbox" id="ignoreLog"> Also resend meters already sent this month</label>
         <button class="primary" id="btnPreview">Preview</button>
       </div>
       <p class="muted small" id="modeNote" style="margin:10px 0 0">Preview only reads the meter data and shows what would be sent. Nothing goes to the vendor until you press Send.</p>
+      <p class="muted small" style="margin:6px 0 0">A meter that was accepted on <b>any day of the push date's month</b> is not sent again (it shows under "Already sent"). In a new month the list starts empty and every meter can be sent again.</p>
       <div id="runMsg"></div>
     </div>
 
@@ -133,7 +134,7 @@
       <h2>2. Check the preview <span class="muted small" id="planTitle"></span></h2>
       <div class="stats">
         <div class="stat ok"><b id="stSend">0</b><span>will be sent</span></div>
-        <div class="stat"><b id="stDone">0</b><span>already sent earlier</span></div>
+        <div class="stat"><b id="stDone">0</b><span>already sent this month</span></div>
         <div class="stat warn"><b id="stSkip">0</b><span>skipped (not sent)</span></div>
       </div>
       <div id="breakdown" class="small" style="margin:12px 0 0"></div>
@@ -603,7 +604,7 @@ function applyMode() {
   const auto = isAuto();
   $('btnPreview').textContent = auto ? 'Run now (preview + send)' : 'Preview';
   $('modeNote').innerHTML = auto
-    ? '<b>Automatic:</b> reads the meter data and then sends to the vendor straight away, with no review step. Meters already sent are not sent again unless you tick "also resend". The result is saved in History.'
+    ? '<b>Automatic:</b> reads the meter data and then sends to the vendor straight away, with no review step. Meters already sent this month are not sent again unless you tick "also resend". The result is saved in History.'
     : 'Preview only reads the meter data and shows what would be sent. Nothing goes to the vendor until you press Send.';
   try { localStorage.setItem('pushMode', auto ? 'auto' : 'manual'); } catch (e) {}
 }

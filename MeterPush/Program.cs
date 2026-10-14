@@ -14,7 +14,7 @@ using Microsoft.Data.SqlClient;
 //   MeterPush --op monthly --date 2026-10-01 --verify-quick 25   check the quick reader against the procedure (read-only)
 //   MeterPush --op monthly --csv f.csv   write everything setMonthly would send to f.csv (+ f_skipped.csv); sends nothing
 //   MeterPush --date 2026-10-01      monthly push date (default: today); opening = this date - 1 month
-//   MeterPush --op monthly --ignore-log   also send services already logged OK for the push date (resend everything)
+//   MeterPush --op monthly --ignore-log   also send services already logged OK in the push date's month (resend everything)
 
 var opts = ParseArgs(args);
 var settingsPath = Path.Combine(AppContext.BaseDirectory, "appsettings.json");

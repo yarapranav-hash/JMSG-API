@@ -142,7 +142,7 @@ api.MapGet("/plans/{id}", (string id) =>
 api.MapGet("/plans/{id}/records", (string id, int? skip, int? take, string? q, string? which) =>
 {
     if (!Runner.Plans.TryGetValue(id, out var sp)) return Results.NotFound(new { error = "This preview has expired. Run Preview again." });
-    // which=done: the meters already sent for this push date (not part of this send)
+    // which=done: the meters already sent in this push date's month (not part of this send)
     var source = which == "done" ? sp.Plan.Items.Where(i => i.Done && !sp.Plan.ToSend.Contains(i)) : sp.Plan.ToSend;
     var rows = source.Where(i => Matches(q, i.ServiceNo, i.Unique, V(i, "meter_no"), V(i, "scno"))).ToList();
     return Results.Ok(new

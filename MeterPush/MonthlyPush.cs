@@ -797,11 +797,15 @@ VALUES (@d, @n, @u, @o, @r, @ok, @od, @md, @x{(vars.Count > 0 ? ", " + string.Jo
         return d;
     }
 
+    // "Already sent" = accepted (OK) for ANY push date in the same calendar month as pushDate. A meter sent on 01-10 is not sent again
+    // on 02-10 ... 31-10; in a new month the list starts empty again. (Failed and skipped rows do not count.)
     HashSet<string> LoadDone(DateTime pushDate)
     {
         var set = new HashSet<string>(StringComparer.Ordinal);
-        using var cmd = new SqlCommand("SELECT ServiceNo FROM dbo.PushLog_Monthly WHERE PushDate=@d AND Status='OK'", db);
-        cmd.Parameters.AddWithValue("@d", pushDate.Date);
+        var first = new DateTime(pushDate.Year, pushDate.Month, 1);
+        using var cmd = new SqlCommand("SELECT DISTINCT ServiceNo FROM dbo.PushLog_Monthly WHERE PushDate>=@from AND PushDate<@to AND Status='OK'", db);
+        cmd.Parameters.AddWithValue("@from", first);
+        cmd.Parameters.AddWithValue("@to", first.AddMonths(1));
         using var r = cmd.ExecuteReader();
         while (r.Read()) set.Add(r.GetString(0).Trim());
         return set;
