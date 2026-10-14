@@ -12,6 +12,7 @@ using Microsoft.Data.SqlClient;
 var builder = WebApplication.CreateBuilder(args);
 var connStr = builder.Configuration["ConnectionString"] ?? throw new InvalidOperationException("ConnectionString is missing in appsettings.json");
 var accessCode = builder.Configuration["AccessCode"] ?? "";
+builder.Services.AddHostedService(_ => new HourlyScheduler(connStr)); // automatic hourly push (switched on in the Hourly: Automatic tab)
 var app = builder.Build();
 
 app.UseDefaultFiles();
@@ -79,7 +80,7 @@ api.MapPost("/upload", async (HttpRequest req) =>
     catch (System.Xml.XmlException) { return Results.BadRequest(new { error = "This does not look like a valid .xlsx file." }); }
 });
 
-api.MapGet("/jobs/active", () => Runner.Active is { } j ? Results.Ok(new { jobId = j.Id, kind = j.Kind, op = j.Op }) : Results.Ok(new { jobId = (string?)null }));
+api.MapGet("/jobs/active", () => Runner.Active is { } j ? Results.Ok(new { jobId = j.Id, kind = j.Kind, op = j.Op, scheduled = j.Scheduled }) : Results.Ok(new { jobId = (string?)null }));
 
 api.MapGet("/jobs/{id}", (string id, int? from) =>
 {
@@ -95,6 +96,24 @@ api.MapGet("/jobs/{id}", (string id, int? from) =>
         failures = FailuresOf(j).Select(f => new { serviceNo = f.ServiceNo, ukscno = f.Unique, reply = f.Reply, meaning = ReplyMeaning(f.Reply), emptyFields = f.Empty }),
         stoppedBecause = j.StoppedBecause, lines, nextLine = start + lines.Length
     });
+});
+
+// monthly: the meters the API did not accept in this send, with the reply and the values of the request
+api.MapGet("/jobs/{id}/failures/download", (string id) =>
+{
+    if (!Runner.Jobs.TryGetValue(id, out var j)) return Results.NotFound(new { error = "Unknown job." });
+    var fails = FailuresOf(j);
+    Runner.Plans.TryGetValue(j.PlanId ?? "", out var sp);
+    var prms = sp?.Plan.Prms ?? new List<MonthlyPush.Param>();
+    var rows = new List<string[]> { new[] { "service_no", "ukscno", "api_reply", "meaning", "fields_left_out" }.Concat(prms.Select(p => p.Name)).ToArray() };
+    foreach (var f in fails)
+    {
+        var it = sp?.Plan.Items.FirstOrDefault(i => i.ServiceNo == f.ServiceNo);
+        rows.Add(new[] { f.ServiceNo, f.Unique, f.Reply, ReplyMeaning(f.Reply), string.Join(", ", f.Empty) }
+            .Concat(prms.Select(p => it == null ? "" : SentValue(p, it))).ToArray());
+    }
+    var book = XlsxWriter.Build(new[] { ("Failed", rows) });
+    return Results.File(book, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", $"monthly_failed_{j.PushDate}.xlsx");
 });
 
 api.MapPost("/jobs/{id}/stop", (string id) =>
@@ -370,6 +389,42 @@ ORDER BY PushedOn DESC, ServiceNo", db))
     return Results.Ok(new { counts, rows });
 });
 
+// ---- automatic runs (scheduler)
+
+api.MapGet("/hourly/scheduler", () =>
+{
+    var ready = RunStore.Ready(connStr);
+    var on = SchedulerSetting.IsOn(connStr);
+    var now = DateTime.Now;
+    var slot = now.Date.AddHours(now.Hour);
+    string next;
+    if (!on) next = "off";
+    else if (now.Minute < HourlyScheduler.Minute) next = slot.AddMinutes(HourlyScheduler.Minute).ToString("yyyy-MM-dd HH:mm");
+    else if (ready && !RunStore.HasRun(connStr, slot.Date, slot.Hour) && now.Minute < HourlyScheduler.WindowEnd) next = "now";
+    else next = slot.AddHours(1).AddMinutes(HourlyScheduler.Minute).ToString("yyyy-MM-dd HH:mm");
+    var a = Runner.Active is { Op: "hourly" } j ? new { label = j.PushDate, kind = j.Kind, index = j.Index, total = j.Total, pushed = j.Pushed, failed = j.Failed } : null;
+    return Results.Ok(new { ready, on, minute = HourlyScheduler.Minute, windowEnd = HourlyScheduler.WindowEnd, next, serverTime = now.ToString("yyyy-MM-dd HH:mm:ss"), running = a });
+});
+
+api.MapPost("/hourly/scheduler", (SchedulerReq req) =>
+{
+    if (req.Enabled && !RunStore.Ready(connStr))
+        return Results.BadRequest(new { error = "Cannot switch on: run sql\\05_create_PushLog_Hourly.sql and sql\\06_create_PushRun_Hourly.sql in SQL Server first." });
+    SchedulerSetting.Set(connStr, req.Enabled);
+    return Results.Ok(new { on = req.Enabled });
+});
+
+api.MapGet("/hourly/runs", (int? take) =>
+{
+    if (!RunStore.Ready(connStr)) return Results.Ok(new { ready = false, rows = Array.Empty<object>() });
+    var rows = RunStore.List(connStr, take ?? 72).Select(r => new
+    {
+        runId = r.RunId, date = r.ReadingDate.ToString("yyyy-MM-dd"), hour = r.ReadingHour, started = r.StartedOn, finished = r.FinishedOn, state = r.State,
+        planned = r.Planned, alreadySent = r.AlreadySent, skipped = r.Skipped, accepted = r.Accepted, failed = r.Failed, replies = r.Replies, message = r.Message
+    });
+    return Results.Ok(new { ready = true, rows });
+});
+
 // Excel of what was sent for one date and hour: the meter's "Date & Time" from the table, the API reply and every value of the request
 api.MapGet("/hourly/history/download", (string date, int hour, string? status, string? q) =>
 {
@@ -560,3 +615,4 @@ static string ReplyMeaning(string reply)
 record PreviewReq(string Date, int? Limit, bool IgnoreLog, bool Auto = false);
 record HourlyPreviewReq(string Date, int Hour, int? Limit, bool IgnoreLog, bool Auto = false);
 record SendReq(int ConfirmCount);
+record SchedulerReq(bool Enabled);

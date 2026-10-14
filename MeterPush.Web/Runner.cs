@@ -7,6 +7,7 @@ class Job
 {
     public string Id = Guid.NewGuid().ToString("N")[..8];
     public string Op = "monthly";            // monthly | hourly
+    public bool Scheduled;                   // started by the automatic hourly scheduler (shown in the Hourly: Automatic tab)
     public string Kind = "";                 // preview | send
     public string State = "Running";         // Running | Done | Failed | Stopped
     public DateTime Started = DateTime.Now;
@@ -174,6 +175,51 @@ static class Runner
             job.PlanId = sp.Id;
             job.Total = sp.Plan.ToSend.Count;
             DoHourlySend(job, connStr, sp);
+        }, out error, "hourly");
+
+    // The automatic run (HourlyScheduler): full read for the date, send everything at the hour that was not sent before, summarise in dbo.PushRun_Hourly.
+    public static Job? StartScheduledHourly(string connStr, DateTime date, int hour, out string? error) =>
+        TryStart("preview", $"{date:yyyy-MM-dd} {hour:00}:00", job =>
+        {
+            int runId = 0;
+            job.Scheduled = true;
+            try
+            {
+                job.Log($"Scheduler: automatic hourly run for {date:yyyy-MM-dd} {hour:00}:00");
+                runId = RunStore.Start(connStr, date, hour);
+                var (db, global) = Open(connStr);
+                using var dbScope = db;
+                using var http = new HttpClient();
+                var plan = new HourlyPush(db, connStr, http, global, job.Log).Plan(date, hour, 0, false);
+                var sp = new StoredHourlyPlan { Plan = plan, Sent = true };
+                HPlans[sp.Id] = sp;
+                job.PlanId = sp.Id;
+                job.Total = plan.ToSend.Count;
+                var already = plan.Items.Count(i => i.Done);
+                RunStore.Update(connStr, runId, "Running", plan.ToSend.Count, already, plan.Skips.Count, 0, 0, null, null, false);
+
+                if (plan.ToSend.Count == 0)
+                {
+                    job.Log("Scheduler: nothing to send.");
+                    RunStore.Update(connStr, runId, "Nothing", 0, already, plan.Skips.Count, 0, 0, null,
+                        $"nothing to send: {plan.Items.Count} meter(s) have a reading at {hour:00}:00, {already} of them already sent", true);
+                    return;
+                }
+                if (!plan.LogReady) throw new InvalidOperationException("dbo.PushLog_Hourly does not exist (run sql\\05_create_PushLog_Hourly.sql).");
+
+                job.Kind = "send";
+                DoHourlySend(job, connStr, sp);
+
+                var state = job.Failed == 0 && job.StoppedBecause == null ? "Passed" : job.Pushed == 0 ? "Failed" : "Partial";
+                var message = job.StoppedBecause != null ? $"stopped: {job.StoppedBecause}; {plan.ToSend.Count - job.Pushed - job.Failed} meter(s) not sent" : null;
+                RunStore.Update(connStr, runId, state, plan.ToSend.Count, already, plan.Skips.Count, job.Pushed, job.Failed,
+                    string.Join("; ", job.Replies.OrderByDescending(r => r.Value).Select(r => $"{r.Key}: {r.Value}")), message, true);
+            }
+            catch (Exception ex)
+            {
+                if (runId > 0) { try { RunStore.Fail(connStr, runId, ex.Message); } catch { } }
+                throw; // TryStart marks the job as failed and logs it
+            }
         }, out error, "hourly");
 
     static void DoHourlySend(Job job, string connStr, StoredHourlyPlan sp)

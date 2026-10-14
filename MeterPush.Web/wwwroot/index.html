@@ -77,7 +77,8 @@
   <nav>
     <button id="navRun" class="on">Monthly: Run</button>
     <button id="navHist">Monthly: History</button>
-    <button id="navHourly">Hourly</button>
+    <button id="navHourly">Hourly: Manual</button>
+    <button id="navSched">Hourly: Automatic</button>
   </nav>
   <span class="muted small" style="margin-left:auto" id="apiName">Vendor API: setMonthly</span>
 </header>
@@ -243,10 +244,33 @@
         <div><label for="hhSearch">Search</label><input type="text" id="hhSearch" placeholder="service, unique no, meter, reply" style="width:240px"></div>
         <button class="primary" id="hhGo">Show</button>
         <button class="secondary" id="hhDl">Download Excel (.xlsx)</button>
+        <button class="secondary" id="hhDlF">Download failed only (.xlsx)</button>
       </div>
       <div class="stats" id="hhStats" style="margin-top:14px"></div>
       <div class="scroll" style="margin-top:12px"><table id="hhTable"></table></div>
       <p class="muted small" id="hhNote">Nothing sent yet from this tab (or the table dbo.PushLog_Hourly is not created yet).</p>
+    </div>
+  </section>
+
+  <!-- ============================== HOURLY: AUTOMATIC ============================== -->
+  <section id="sched" class="hidden">
+    <div class="card">
+      <h2>Automatic hourly push</h2>
+      <div class="row" style="align-items:center">
+        <div><span class="pill" id="scState">...</span></div>
+        <button class="primary" id="scToggle" disabled>...</button>
+        <span class="muted small" id="scNext"></span>
+      </div>
+      <p class="muted small" style="margin:10px 0 0">When ON, the program pushes the hourly data by itself at <b>2 minutes past every hour</b> (12:02, 13:02 ...). The 12:02 run takes today's date and the <b>12:00</b> readings: only meters whose latest reading is exactly 12:00 are sent, meters already sent for that hour are not sent again. It starts until 29 minutes past if it was busy or the program had just started. It only runs while the program (start-web.bat) is running. Nothing is sent when it is OFF.</p>
+      <div id="scMsg"></div>
+      <div id="scRunning" class="msg warn hidden"></div>
+    </div>
+
+    <div class="card">
+      <h2>Automatic runs <span class="muted small">(updates by itself every 5 seconds)</span></h2>
+      <div class="stats" id="scStats"></div>
+      <div class="scroll" style="margin-top:12px;max-height:520px"><table id="scTable"></table></div>
+      <p class="muted small" id="scNote">Click a run to see the meters that failed.</p>
     </div>
   </section>
 </main>
@@ -306,10 +330,14 @@ const showMsg = (kind, text) => { $('runMsg').innerHTML = text ? `<div class="ms
 
 // ---------- navigation
 $('navRun').onclick = () => nav('run'); $('navHist').onclick = () => { nav('hist'); loadDates(); }; $('navHourly').onclick = () => { nav('hourly'); loadHSlots(); };
+$('navSched').onclick = () => nav('sched');
+let curTab = 'run';
 function nav(w) {
-  $('run').classList.toggle('hidden', w !== 'run'); $('hist').classList.toggle('hidden', w !== 'hist'); $('hourly').classList.toggle('hidden', w !== 'hourly');
-  $('navRun').classList.toggle('on', w === 'run'); $('navHist').classList.toggle('on', w === 'hist'); $('navHourly').classList.toggle('on', w === 'hourly');
-  $('apiName').textContent = 'Vendor API: ' + (w === 'hourly' ? 'setHourly' : 'setMonthly');
+  curTab = w;
+  $('run').classList.toggle('hidden', w !== 'run'); $('hist').classList.toggle('hidden', w !== 'hist'); $('hourly').classList.toggle('hidden', w !== 'hourly'); $('sched').classList.toggle('hidden', w !== 'sched');
+  $('navRun').classList.toggle('on', w === 'run'); $('navHist').classList.toggle('on', w === 'hist'); $('navHourly').classList.toggle('on', w === 'hourly'); $('navSched').classList.toggle('on', w === 'sched');
+  $('apiName').textContent = 'Vendor API: ' + (w === 'hourly' || w === 'sched' ? 'setHourly' : 'setMonthly');
+  if (w === 'sched') loadSched();
 }
 
 // ---------- hourly (setHourly)
@@ -454,10 +482,12 @@ function showHResult(j) {
       ? '<h3 style="margin:16px 0 6px;font-size:15px">Why meters failed</h3><div class="scroll"><table><tr><th>Service no</th><th>Unique no</th><th>API reply</th><th>What it usually means</th></tr>' +
         j.failures.map(f => `<tr><td>${esc(f.serviceNo)}</td><td>${esc(f.ukscno)}</td><td>${esc(f.reply)}</td><td class="wrap">${esc(failHint(f))}</td></tr>`).join('') + '</table></div>' : '') +
     '<details open style="margin-top:12px"><summary class="small muted" style="cursor:pointer">Show log</summary><pre>' + esc($('hrLog').textContent) + '</pre></details>' +
-    '<p style="margin:12px 0 4px"><button class="primary" id="hrDlSent">Download Excel of what was sent (with Date &amp; Time from the table)</button></p>' +
+    '<p style="margin:12px 0 4px"><button class="primary" id="hrDlSent">Download Excel of what was sent (with Date &amp; Time from the table)</button> ' +
+    (j.failed > 0 ? '<button class="danger" id="hrDlFail">Download Excel of the failed meters</button>' : '') + '</p>' +
     '<p class="small muted">Every record and the reply is saved - see Hourly history below (click a row to see the full request).</p>';
   // j.pushDate is "yyyy-MM-dd HH:00"
   $('hrDlSent').onclick = () => downloadHSent(j.pushDate.slice(0, 10), +j.pushDate.slice(11, 13), '', '');
+  if ($('hrDlFail')) $('hrDlFail').onclick = () => downloadHSent(j.pushDate.slice(0, 10), +j.pushDate.slice(11, 13), 'FAILED', '');
 }
 
 // hourly history
@@ -474,8 +504,9 @@ async function downloadHSent(date, hour, status, q) {
   const res = await api(`/hourly/history/download?date=${date}&hour=${hour}&status=${status || ''}&q=${encodeURIComponent(q || '')}`, { raw: true });
   if (!res.ok) { const e = await res.json().catch(() => ({})); alert(e.error || 'Download failed'); return; }
   const blob = await res.blob(); const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob); a.download = `hourly_sent_${date}_${String(hour).padStart(2, '0')}.xlsx`; a.click();
+  a.href = URL.createObjectURL(blob); a.download = `hourly_${status === 'FAILED' ? 'failed' : 'sent'}_${date}_${String(hour).padStart(2, '0')}.xlsx`; a.click();
 }
+$('hhDlF').onclick = () => { const v = $('hhSlot').value; if (!v) return; const [date, hour] = v.split('|'); downloadHSent(date, +hour, 'FAILED', ''); };
 $('hhDl').onclick = () => { const v = $('hhSlot').value; if (!v) return; const [date, hour] = v.split('|'); downloadHSent(date, +hour, $('hhStatus').value, $('hhSearch').value); };
 $('hhSearch').onkeydown = e => { if (e.key === 'Enter') loadHHistory(); };
 async function loadHHistory() {
@@ -493,6 +524,74 @@ async function loadHHistory() {
     $('detailModal').classList.remove('hidden');
   });
   $('hhNote').textContent = `Showing the latest ${d.rows.length} row(s) (max 300).`;
+}
+
+// ---------- hourly: automatic (scheduler)
+const hhmm = h => String(h).padStart(2, '0') + ':00';
+const RUN_STATE = { Passed: ['OK', 'All sent'], Partial: ['SKIPPED', 'Some failed'], Failed: ['FAILED', 'Failed'], Nothing: ['SKIPPED', 'Nothing to send'], Missed: ['FAILED', 'Missed'], Running: ['', 'Running...'] };
+const runPill = s => { const [cls, text] = RUN_STATE[s] || ['', s]; return `<span class="pill ${cls}">${esc(text)}</span>`; };
+const timeOf = t => (t || '').replace('T', ' ').slice(11, 19);
+let scBusy = false;
+async function loadSched() {
+  if (curTab !== 'sched' || scBusy) return;
+  scBusy = true;
+  try {
+    const [s, r] = await Promise.all([api('/hourly/scheduler'), api('/hourly/runs?take=72')]);
+    $('scState').className = 'pill ' + (s.on ? 'OK' : 'SKIPPED'); $('scState').textContent = s.on ? 'Scheduler ON' : 'Scheduler OFF';
+    $('scToggle').disabled = false; $('scToggle').textContent = s.on ? 'Switch OFF' : 'Switch ON'; $('scToggle').className = s.on ? 'secondary' : 'primary'; $('scToggle').dataset.on = s.on ? '1' : '';
+    $('scNext').textContent = !s.on ? 'Nothing is sent automatically.' : s.next === 'now' ? 'Due now - starts within a few seconds.' : 'Next run: ' + s.next + ' (server time now ' + s.serverTime + ')';
+    $('scMsg').innerHTML = s.ready ? '' : '<div class="msg warn">The tables for the automatic runs are missing. Run <b>sql\\05_create_PushLog_Hourly.sql</b> and <b>sql\\06_create_PushRun_Hourly.sql</b> in SQL Server, then refresh this page.</div>';
+    $('scRunning').classList.toggle('hidden', !s.running);
+    if (s.running) $('scRunning').textContent = s.running.kind === 'send'
+      ? `Running now for ${s.running.label}: sent ${s.running.index} of ${s.running.total} (accepted ${s.running.pushed}, failed ${s.running.failed})`
+      : `Running now for ${s.running.label}: reading the meter data...`;
+
+    const rows = r.rows || [];
+    const today = new Date().toLocaleDateString('sv-SE');
+    const td = rows.filter(x => x.date === today);
+    const last = rows[0];
+    $('scStats').innerHTML = rows.length
+      ? `<div class="stat"><b>${last ? hhmm(last.hour) : '-'}</b><span>last run: ${last ? esc((RUN_STATE[last.state] || ['', last.state])[1]) : ''}</span></div>` +
+        `<div class="stat ok"><b>${td.reduce((a, x) => a + x.accepted, 0)}</b><span>meters accepted today</span></div>` +
+        `<div class="stat bad"><b>${td.reduce((a, x) => a + x.failed, 0)}</b><span>meters failed today</span></div>` +
+        `<div class="stat warn"><b>${td.filter(x => ['Partial', 'Failed', 'Missed'].includes(x.state)).length}</b><span>runs with problems today</span></div>`
+      : '';
+    $('scTable').innerHTML = '<tr><th>Reading</th><th>Started</th><th>Took</th><th>Result</th><th>To send</th><th>Accepted</th><th>Failed</th><th>Already sent</th><th>Skipped</th><th>Notes</th></tr>' +
+      rows.map((x, i) => {
+        const took = x.finished ? Math.max(0, Math.round((new Date(x.finished) - new Date(x.started)) / 1000)) + ' s' : '';
+        return `<tr class="click" data-i="${i}"><td>${esc(x.date)} <b>${hhmm(x.hour)}</b></td><td>${esc(timeOf(x.started))}</td><td>${took}</td><td>${runPill(x.state)}</td><td>${x.planned}</td><td>${x.accepted}</td><td>${x.failed}</td><td>${x.alreadySent}</td><td>${x.skipped}</td><td class="wrap muted">${esc(x.message || x.replies || '')}</td></tr>`;
+      }).join('');
+    $('scTable').querySelectorAll('tr.click').forEach(tr => tr.onclick = () => showRun(rows[+tr.dataset.i]));
+    $('scNote').textContent = rows.length ? 'Click a run to see the meters that failed and to download them.' : (s.ready ? 'No automatic run yet.' : '');
+  } catch (e) { $('scNote').textContent = 'Could not load: ' + e.message; }
+  scBusy = false;
+}
+setInterval(loadSched, 5000);
+
+$('scToggle').onclick = async () => {
+  const turnOn = !$('scToggle').dataset.on;
+  if (turnOn && !confirm('Switch the scheduler ON?\n\nFrom the next HH:02 the program will send the hourly data to the vendor API by itself, every hour, without asking.')) return;
+  try { await api('/hourly/scheduler', { method: 'POST', body: JSON.stringify({ enabled: turnOn }) }); $('scMsg').innerHTML = ''; }
+  catch (e) { $('scMsg').innerHTML = `<div class="msg bad">${esc(e.message)}</div>`; return; }
+  loadSched();
+};
+
+async function showRun(r) {
+  $('detailTitle').textContent = `Automatic run for ${r.date} ${hhmm(r.hour)}`;
+  let html = `<p class="small">${runPill(r.state)} &nbsp; <span class="muted">started ${esc((r.started || '').replace('T', ' ').slice(0, 19))}${r.finished ? ', finished ' + esc(timeOf(r.finished)) : ''}</span></p>` +
+    kv([['Meters to send', r.planned], ['Accepted by the API', r.accepted], ['Failed', r.failed], ['Already sent before', r.alreadySent], ['Skipped (not at this hour, missing values ...)', r.skipped], ['API replies', r.replies || ''], ['Notes', r.message || '']]);
+  if (r.failed > 0 || r.state === 'Failed') {
+    try {
+      const d = await api(`/hourly/history?date=${r.date}&hour=${r.hour}&status=FAILED&take=500`);
+      html += `<h3 style="margin:14px 0 6px;font-size:15px">Meters that failed (${d.counts.FAILED || 0})</h3><div class="scroll" style="max-height:260px"><table><tr><th>Service no</th><th>Unique no</th><th>Meter</th><th>Date &amp; Time</th><th>API reply</th></tr>` +
+        d.rows.map(x => `<tr><td>${esc(x.serviceNo)}</td><td>${esc(x.unique)}</td><td>${esc(x.meterNo)}</td><td>${esc(x.readAt)}</td><td class="wrap">${esc(x.reply)}</td></tr>`).join('') + '</table></div>';
+    } catch (e) { html += `<p class="muted small">Could not load the failed list: ${esc(e.message)}</p>`; }
+  }
+  html += '<p style="margin:12px 0 0"><button class="primary" id="rdFail">Download failed meters (Excel)</button> <button class="secondary" id="rdAll">Download everything sent (Excel)</button></p>';
+  $('detailBody').innerHTML = html;
+  $('rdFail').onclick = () => downloadHSent(r.date, r.hour, 'FAILED', '');
+  $('rdAll').onclick = () => downloadHSent(r.date, r.hour, '', '');
+  $('detailModal').classList.remove('hidden');
 }
 
 // ---------- run: preview
@@ -697,8 +796,14 @@ function showResult(j) {
       ? '<h3 style="margin:16px 0 6px;font-size:15px">Why meters failed</h3><div class="scroll"><table><tr><th>Service no</th><th>Unique no</th><th>API reply</th><th>What it usually means</th><th>Fields left out of the request (no value)</th></tr>' +
         j.failures.map(f => `<tr><td>${esc(f.serviceNo)}</td><td>${esc(f.ukscno)}</td><td>${esc(f.reply)}</td><td class="wrap">${esc(failHint(f))}</td><td class="wrap">${f.emptyFields.length ? '<b>' + esc(f.emptyFields.join(', ')) + '</b>' : '-'}</td></tr>`).join('') + '</table></div>'
       : '') +
+    (j.failed > 0 ? '<p style="margin:12px 0 0"><button class="danger" id="btnDlFail">Download failed meters (Excel)</button></p>' : '') +
     '<details open style="margin-top:12px"><summary class="small muted" style="cursor:pointer">Show log</summary><pre>' + esc($('logBox').textContent) + '</pre></details>' +
     '<p class="small muted">Every record and the reply is saved - see the History tab (click a row to see the full request).</p>';
+  if ($('btnDlFail')) $('btnDlFail').onclick = async () => {
+    const res = await api(`/jobs/${j.id}/failures/download`, { raw: true });
+    const blob = await res.blob(); const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = `monthly_failed_${j.pushDate}.xlsx`; a.click();
+  };
 }
 
 // ---------- history
@@ -738,7 +843,8 @@ $('hRetry').onclick = () => { $('date').value = $('hDate').value; $('ignoreLog')
   if (!code) await askCode(false);
   try {
     const a = await api('/jobs/active');
-    if (a.jobId && a.op === 'hourly') { nav('hourly'); startHPolling(a.jobId, a.kind === 'send' ? 'Sending to the vendor API...' : 'Reading the meter data...'); }
+    if (a.jobId && a.scheduled) nav('sched'); // an automatic run: its progress is shown in the Hourly: Automatic tab
+    else if (a.jobId && a.op === 'hourly') { nav('hourly'); startHPolling(a.jobId, a.kind === 'send' ? 'Sending to the vendor API...' : 'Reading the meter data...'); }
     else if (a.jobId) { nav('run'); startPolling(a.jobId, a.kind === 'send' ? 'Sending to the vendor API...' : 'Reading the meter data...'); }
   } catch (e) { showMsg('bad', e.message); }
 })();
