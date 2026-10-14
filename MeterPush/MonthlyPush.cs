@@ -208,6 +208,138 @@ class MonthlyPush
         }
     }
 
+    // ------------------------------------------------------------ records supplied in a file (web upload)
+    // One row per meter, the column headers are the setMonthly parameter names. The values in the file are sent as they are
+    // (nothing is read from the meter tables) after format checks only. A blank cell, or a column that is not in the file, takes the
+    // standard value from PushConfig_Monthly (CONST / PUSHDATE rows); the columns that carry data (readings, MD, ukscno, meter_no, ...) are required.
+
+    static readonly string[] CredentialParams = { "username", "password" };
+    static readonly string[] UploadMayBeEmpty = { "rmd_kva", "closing_kvah" }; // data columns that an uploaded row may leave empty
+
+    // the columns a file must have (data columns) and the ones that fall back to the standard value
+    internal static (List<string> Required, List<(string Name, string Default)> Optional) UploadColumns(List<Param> prms, Func<string?, string?> expand)
+    {
+        var required = new List<string>(); var optional = new List<(string, string)>();
+        foreach (var p in prms)
+        {
+            if (CredentialParams.Contains(p.Name, StringComparer.OrdinalIgnoreCase)) continue;
+            if (UploadMayBeEmpty.Contains(p.Name, StringComparer.OrdinalIgnoreCase)) optional.Add((p.Name, "")); // may be left empty: the element is then not sent
+            else if (p.Type is "CONST" or "PUSHDATE") optional.Add((p.Name, p.Type == "PUSHDATE" ? (p.OffsetMonths is null or 0 ? "push date" : $"push date {p.OffsetMonths:+0;-0} month") : expand(p.Value) ?? ""));
+            else required.Add(p.Name);
+        }
+        return (required, optional);
+    }
+
+    // for the upload screen: every column name (template), the required ones, and the standard values used for blank cells
+    internal (List<string> All, List<string> Required, List<(string Name, string Default)> Optional) UploadInfo()
+    {
+        var prms = LoadParams();
+        var (required, optional) = UploadColumns(prms, Expand);
+        return (prms.Where(p => !CredentialParams.Contains(p.Name, StringComparer.OrdinalIgnoreCase)).Select(p => p.Name).ToList(), required, optional);
+    }
+
+    internal PlanResult PlanFromRows(DateTime pushDate, List<Dictionary<string, string>> rows, string fileName)
+    {
+        var prms = LoadParams();
+        if (prms.Count == 0) throw new InvalidOperationException("PushConfig_Monthly is empty.");
+        var (required, _) = UploadColumns(prms, Expand);
+        var columns = rows.SelectMany(r => r.Keys).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var missingCols = required.Where(n => !columns.Contains(n)).ToList();
+        if (missingCols.Count > 0) throw new InvalidOperationException("The file has no column for: " + string.Join(", ", missingCols) + ". The first row of the file must hold the column names.");
+        var known = prms.Select(p => p.Name).Append("service_no").Append("_row").ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var unknown = columns.Where(c => !known.Contains(c)).ToList();
+        if (unknown.Count > 0) Log("upload: columns not used (not setMonthly parameters): " + string.Join(", ", unknown));
+
+        var services = LoadServices();
+        var byCompact = new Dictionary<string, string>(StringComparer.Ordinal); // scno (no spaces) -> Service No as stored, so "already sent" matches the normal runs
+        foreach (var s in services.Values) byCompact.TryAdd(Regex.Replace(s.ServiceNo, @"\s+", ""), s.ServiceNo);
+        var done = LoadDone(pushDate);
+        prmList = prms;
+        dataCols = LoadDataColumns();
+
+        var items = new List<Item>(); var skips = new List<Skipped>();
+        var seen = new Dictionary<string, int>(StringComparer.Ordinal);
+        var info = new Info(null, null, null);
+        int rowNo = 1;
+        foreach (var row in rows)
+        {
+            rowNo++; // the header is row 1 (the upload reader puts the real row number in "_row")
+            if (row.TryGetValue("_row", out var rn) && int.TryParse(rn, out var realRow)) rowNo = realRow;
+            string Cell(string name) => row.TryGetValue(name, out var s) ? s.Trim() : "";
+
+            var values = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var p in prms)
+            {
+                var cell = CredentialParams.Contains(p.Name, StringComparer.OrdinalIgnoreCase) ? "" : Cell(p.Name);
+                if (cell == "")
+                {
+                    values[p.Name] = p.Type switch
+                    {
+                        "CONST" => Expand(p.Value),
+                        "PUSHDATE" => pushDate.AddMonths(p.OffsetMonths ?? 0).ToString(p.Format ?? "dd/MM/yyyy", Inv),
+                        _ => null
+                    };
+                    continue;
+                }
+                if (p.Quote) cell = cell.Trim('\'');                                   // the quotes are added when the request is built
+                if (p.Name.Equals("scno", StringComparison.OrdinalIgnoreCase)) cell = Regex.Replace(cell, @"\s+", "");
+                if (p.Format != null) cell = NormalizeDate(cell, p.Format);
+                values[p.Name] = cell;
+            }
+
+            var scno = values.GetValueOrDefault("scno") ?? "";
+            var key = Cell("service_no");
+            if (key == "") key = byCompact.GetValueOrDefault(scno) ?? (scno != "" ? scno : $"row {rowNo}");
+            var unique = values.GetValueOrDefault("ukscno") ?? "";
+            var isDone = done.Contains(key);
+            void Skip(string why) => skips.Add(new Skipped(key, unique == "" ? null : unique, why, isDone, values, info));
+
+            // already sent for this date (and not resending): counted as "already sent earlier", not checked and not shown as skipped
+            if (isDone && !opts.IgnoreLog)
+            {
+                items.Add(new Item(key, unique, values, Soap.Envelope(Op, prms.Select(p => (p.Name, Quoted(p, values[p.Name])))), true, info));
+                continue;
+            }
+
+            var empty = required.Where(n => string.IsNullOrEmpty(values.GetValueOrDefault(n))).ToList();
+            if (empty.Count > 0) { Skip($"file: row {rowNo} has no value for {string.Join(", ", empty)}"); continue; }
+            if (!Regex.IsMatch(unique, @"^\d{9}$")) { Skip($"file: row {rowNo} ukscno '{unique}' is not a 9-digit number"); continue; }
+            if (seen.TryGetValue(unique, out var first)) { Skip($"file: row {rowNo} repeats ukscno {unique} from row {first}"); continue; }
+            seen[unique] = rowNo;
+
+            items.Add(new Item(key, unique, values,
+                Soap.Envelope(Op, prms.Select(p => (p.Name, Quoted(p, values[p.Name])))), isDone, info));
+        }
+        Log($"upload: {rows.Count} row(s) read from {fileName}: {items.Count} ready, {skips.Count} skipped, {items.Count(i => i.Done)} already sent for {pushDate:yyyy-MM-dd}");
+
+        var toSend = items.Where(i => opts.IgnoreLog || !i.Done).ToList();
+        return new PlanResult(pushDate, global["ENDPOINT"], prms, items, skips, toSend) { FileName = fileName };
+    }
+
+    // a date cell given as an Excel serial number or in ISO form is written in the format of the parameter; anything else is sent as typed
+    static string NormalizeDate(string v, string fmt)
+    {
+        if (DateTime.TryParseExact(v, fmt, Inv, DateTimeStyles.None, out _)) return v;
+        if (double.TryParse(v, NumberStyles.Float, Inv, out var serial) && serial is > 20000 and < 80000)
+            return DateTime.FromOADate(serial).ToString(fmt, Inv);
+        if (DateTime.TryParseExact(v, DateFormats, Inv, DateTimeStyles.None, out var parsed))
+            return parsed.ToString(fmt, Inv);
+        return v;
+    }
+
+    // day-first dates with - or /, 12 or 24 hour time (with or without seconds), and ISO dates
+    static readonly string[] DateFormats = BuildDateFormats();
+    static string[] BuildDateFormats()
+    {
+        var list = new List<string> { "yyyy-MM-dd", "yyyy-MM-dd HH:mm", "yyyy-MM-dd HH:mm:ss", "yyyy-MM-ddTHH:mm:ss" };
+        var times = new[] { "", " h:mm tt", " h:mm:ss tt", " H:mm", " H:mm:ss" };
+        foreach (var sep in new[] { "-", "/" })
+            foreach (var year in new[] { "yyyy", "yy" })
+                foreach (var t in times)
+                    list.Add($"d{sep}M{sep}{year}{t}");
+        return list.ToArray();
+    }
+
     // ------------------------------------------------------------ quick test (a test limit is set)
     // The full procedure reads every meter (1-8 minutes). For a test of a few meters it is much faster to read only the
     // candidate meters, straight from their own modem table, with the same selection rule the procedure uses:
@@ -446,6 +578,7 @@ WHERE RK=1", conn) { CommandTimeout = 300 };
         public int NewSkips => Skips.Count(s => !s.Done);
         public bool Quick { get; init; }       // quick test: only some meters were read, so the counts are not for the whole day
         public int Examined { get; init; }     // quick test: how many meters were looked at
+        public string? FileName { get; init; } // set when the records came from an uploaded file
         public PlanResult(DateTime pushDate, string endpoint, List<Param> prms, List<Item> items, List<Skipped> skips, List<Item> toSend)
         { PushDate = pushDate; Endpoint = endpoint; Prms = prms; Items = items; Skips = skips; ToSend = toSend; }
     }

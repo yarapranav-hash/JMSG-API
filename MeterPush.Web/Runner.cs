@@ -16,6 +16,7 @@ class Job
     public int Total, Index, Pushed, Failed;
     public Dictionary<string, int> Replies = new();
     public string? StoppedBecause;
+    public readonly List<FailRow> Failures = new();   // meters the API did not accept, with the reply
     public readonly List<string> Lines = new();
     public readonly CancellationTokenSource Cts = new();
 
@@ -26,6 +27,9 @@ class Job
         Console.WriteLine($"[{Kind} {Id}] {line}"); // also visible in the window the app runs in
     }
 }
+
+// Empty = request fields that had no value (their element was left out), a likely reason for "Un-Successful:null"
+record FailRow(string ServiceNo, string Unique, string Reply, List<string> Empty);
 
 class StoredPlan
 {
@@ -99,6 +103,28 @@ static class Runner
             DoSend(job, connStr, sp);
         }, out error);
 
+    // records from an uploaded file: checked on the spot (no meter tables are read), kept as a plan that is previewed and sent like any other
+    public static StoredPlan PlanUpload(string connStr, DateTime date, bool ignoreLog, List<Dictionary<string, string>> rows, string fileName, List<string> notes)
+    {
+        var (db, global) = Open(connStr);
+        using var dbScope = db;
+        using var http = new HttpClient();
+        var opts = new Opts { Op = "monthly", Date = date, IgnoreLog = ignoreLog, DryRun = true };
+        var plan = new MonthlyPush(db, connStr, http, global, opts, notes.Add).PlanFromRows(date, rows, fileName);
+        var sp = new StoredPlan { Plan = plan, Opts = opts };
+        Plans[sp.Id] = sp;
+        foreach (var old in Plans.Values.Where(p => p.Created < DateTime.Now.AddHours(-3))) Plans.TryRemove(old.Id, out _);
+        return sp;
+    }
+
+    public static (List<string> All, List<string> Required, List<(string Name, string Default)> Optional) UploadInfo(string connStr)
+    {
+        var (db, global) = Open(connStr);
+        using var dbScope = db;
+        using var http = new HttpClient();
+        return new MonthlyPush(db, connStr, http, global, new Opts { Op = "monthly" }).UploadInfo();
+    }
+
     public static Job? StartSend(string connStr, StoredPlan sp, out string? error) =>
         TryStart("send", sp.Plan.PushDate.ToString("yyyy-MM-dd"), job =>
         {
@@ -116,6 +142,12 @@ static class Runner
         var res = new MonthlyPush(db, connStr, http, global, opts, job.Log).Execute(sp.Plan, p =>
         {
             job.Index = p.Index; job.Pushed = p.Pushed; job.Failed = p.Failed;
+            if (p.Ok) return;
+            var it = sp.Plan.ToSend.FirstOrDefault(i => i.ServiceNo == p.ServiceNo);
+            var empty = it == null ? new List<string>() : sp.Plan.Prms
+                .Where(x => !(x.Type == "CONST" && string.IsNullOrEmpty(x.Value)) && string.IsNullOrEmpty(it.Values.GetValueOrDefault(x.Name)))
+                .Select(x => x.Name).ToList();
+            lock (job.Failures) job.Failures.Add(new FailRow(p.ServiceNo, it?.Unique ?? "", p.Reply, empty));
         }, job.Cts.Token);
         job.Pushed = res.Pushed; job.Failed = res.Failed;
         job.Replies = res.Replies;

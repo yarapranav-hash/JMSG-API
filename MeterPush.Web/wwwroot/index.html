@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Monthly Meter Push</title>
+<title>Meter Push</title>
 <style>
   :root {
     --bg: #f5f6f8; --card: #ffffff; --ink: #1c2330; --muted: #5b6577; --line: #dde1e8;
@@ -73,12 +73,13 @@
 </head>
 <body>
 <header>
-  <h1>Monthly Meter Push</h1>
+  <h1>Meter Push</h1>
   <nav>
-    <button id="navRun" class="on">Run</button>
-    <button id="navHist">History</button>
+    <button id="navRun" class="on">Monthly: Run</button>
+    <button id="navHist">Monthly: History</button>
+    <button id="navHourly">Hourly</button>
   </nav>
-  <span class="muted small" style="margin-left:auto">Vendor API: setMonthly</span>
+  <span class="muted small" style="margin-left:auto" id="apiName">Vendor API: setMonthly</span>
 </header>
 
 <main>
@@ -105,6 +106,20 @@
       <div id="runMsg"></div>
     </div>
 
+    <div class="card" id="uploadCard">
+      <h2>Or send from a file</h2>
+      <p class="muted small" style="margin:0 0 10px">Upload an Excel (.xlsx) or CSV file with one row per meter and the API values in it. The values are sent as they are (nothing is read from the meter tables). It uses the push date and the "also resend" tick above, and always shows the preview first.</p>
+      <div class="row">
+        <div><label for="upFile">File</label><input type="file" id="upFile" accept=".xlsx,.csv"></div>
+        <button class="primary" id="btnUpload">Upload and preview</button>
+        <button class="secondary" id="btnTemplate">Download template (CSV)</button>
+      </div>
+      <details style="margin-top:10px"><summary class="small muted" style="cursor:pointer">What must the file contain?</summary>
+        <div id="upInfo" class="small" style="margin-top:8px">Loading...</div>
+      </details>
+      <div id="upMsg"></div>
+    </div>
+
     <div class="card hidden" id="progressCard">
       <h2 id="progressTitle">Working...</h2>
       <div class="bar"><div id="bar"></div></div>
@@ -122,7 +137,7 @@
       </div>
       <div id="breakdown" class="small" style="margin:12px 0 0"></div>
 
-      <div class="tabs"><button id="tabSend" class="on">To send</button><button id="tabSkip">Skipped</button></div>
+      <div class="tabs"><button id="tabSend" class="on">To send</button><button id="tabDone">Already sent</button><button id="tabSkip">Skipped</button></div>
       <div class="row" style="margin-bottom:8px">
         <div><input type="text" id="search" placeholder="Search service / meter..." style="width:260px"></div>
         <button class="secondary" id="btnDl">Download as Excel (CSV)</button>
@@ -157,6 +172,16 @@
       <div class="stats" id="hStats" style="margin-top:14px"></div>
       <div class="scroll" style="margin-top:12px"><table id="hTable"></table></div>
       <p class="muted small" id="hNote"></p>
+    </div>
+  </section>
+
+  <!-- ============================== HOURLY ============================== -->
+  <section id="hourly" class="hidden">
+    <div class="card">
+      <h2>Hourly push (setHourly)</h2>
+      <div class="msg warn" style="margin-top:0"><b>Not connected yet.</b> The fields below come from the request that works with the vendor. Next step: for each field, say which table / column (or fixed value) it is taken from. Preview and Send for hourly are added after that, and nothing is sent from this tab for now.</div>
+      <p class="muted small" style="margin:8px 0 12px">Sample values are from the working test request. <code>username</code> and <code>password</code> are added from the settings.</p>
+      <div class="scroll" style="max-height:none"><table id="hourlyTable"></table></div>
     </div>
   </section>
 </main>
@@ -215,11 +240,25 @@ function askCode(wrong) {
 const showMsg = (kind, text) => { $('runMsg').innerHTML = text ? `<div class="msg ${kind}">${esc(text)}</div>` : ''; };
 
 // ---------- navigation
-$('navRun').onclick = () => nav('run'); $('navHist').onclick = () => { nav('hist'); loadDates(); };
+$('navRun').onclick = () => nav('run'); $('navHist').onclick = () => { nav('hist'); loadDates(); }; $('navHourly').onclick = () => nav('hourly');
 function nav(w) {
-  $('run').classList.toggle('hidden', w !== 'run'); $('hist').classList.toggle('hidden', w !== 'hist');
-  $('navRun').classList.toggle('on', w === 'run'); $('navHist').classList.toggle('on', w === 'hist');
+  $('run').classList.toggle('hidden', w !== 'run'); $('hist').classList.toggle('hidden', w !== 'hist'); $('hourly').classList.toggle('hidden', w !== 'hourly');
+  $('navRun').classList.toggle('on', w === 'run'); $('navHist').classList.toggle('on', w === 'hist'); $('navHourly').classList.toggle('on', w === 'hourly');
+  $('apiName').textContent = 'Vendor API: ' + (w === 'hourly' ? 'setHourly' : 'setMonthly');
 }
+
+// ---------- hourly: the setHourly fields (sample values from the request that works); sources are filled in later
+const HOURLY_SAMPLE = [
+  ['vendor_code', '0'], ['reading_date', '01/10/26'], ['reading_time', '12:30:00'], ['unique_scno', '030102233'], ['reading_kvah', '10719'],
+  ['reading_kwh', '8932.13'], ['kwh_status', '0'], ['kvah_status', '0'], ['rmd_kw', '1.32'], ['rmd_kva', '0.02'], ['phase', '1'],
+  ['meterno', 'A05356'], ['metermake', 'ECIL'], ['mf', '1'], ['pf', '1'], ['deducted_amt', '0'], ['balance_amt', '0'],
+  ['old_reading_kvah', '10545'], ['old_reading_kwh', '8769'], ['new_reading_kvah', '10719'], ['new_reading_kwh', '8932.13'], ['new_meter_mf', '0'],
+  ['r_vol', '0'], ['y_vol', '0'], ['b_vol', '0'], ['r_cur', '0'], ['y_cur', '0'], ['b_cur', '0'], ['vol_cur_miss_flag', 'Y'],
+  ['consumed_units', '163'], ['relay_status', '0'], ['opn_rdg', '0'], ['opn_balance', '0'], ['slab_rate', '0'], ['crje', '0'], ['drje', '0'],
+  ['echgs', '0'], ['fchgs', '0'], ['cchgs', '0'], ['edchgs', '0'], ['mphase', '1'], ['scno', '030102233']
+];
+$('hourlyTable').innerHTML = '<tr><th>#</th><th>Field</th><th>Sample value</th><th>Taken from</th></tr>' +
+  HOURLY_SAMPLE.map((f, i) => `<tr><td class="muted">${i + 1}</td><td><code>${esc(f[0])}</code></td><td>${esc(f[1])}</td><td class="muted">to be defined</td></tr>`).join('');
 
 // ---------- run: preview
 function firstOfMonth() { const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1).toLocaleDateString('sv-SE'); }
@@ -247,13 +286,56 @@ $('btnPreview').onclick = async () => {
   } catch (e) { showMsg('bad', e.message); }
 };
 
+// ---------- run: upload a file
+let upLoaded = false;
+async function loadUploadInfo() {
+  if (upLoaded) return;
+  try {
+    const i = await api('/upload/info');
+    $('upInfo').innerHTML =
+      '<p style="margin:0 0 6px">The first row holds the column names (same names as the API fields). These columns are <b>required</b> and every row needs a value in them:</p>' +
+      `<p style="margin:0 0 8px"><code>${i.required.map(esc).join(', ')}</code></p>` +
+      '<p style="margin:0 0 6px">These are optional. If the column is missing, or a cell is blank, the standard value is used:</p>' +
+      '<p style="margin:0 0 8px">' + i.optional.map(o => `<code>${esc(o.name)}</code> = ${esc(o.standard) || '(empty)'}`).join(' &middot; ') + '</p>' +
+      '<p style="margin:0 0 6px">Dates can be typed as text in the same format as the History screen (for example 14/10/2026 11:30:00 PM) or as normal Excel dates. Leave status and billing_status blank (they become 01). An optional <code>service_no</code> column (like 0216 00011) lets the page recognise meters already sent. Only the first sheet is read. Username and password are always taken from the settings.</p>';
+    upLoaded = true;
+  } catch (e) { $('upInfo').textContent = 'Could not load the details: ' + e.message; }
+}
+loadUploadInfo();
+const showUpMsg = (kind, text) => { $('upMsg').innerHTML = text ? `<div class="msg ${kind}">${esc(text)}</div>` : ''; };
+
+$('btnTemplate').onclick = async () => {
+  const res = await api('/upload/template', { raw: true });
+  const blob = await res.blob(); const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = 'setMonthly_upload_template.csv'; a.click();
+};
+
+$('btnUpload').onclick = async () => {
+  showUpMsg('', ''); showMsg('', ''); $('planCard').classList.add('hidden'); $('resultCard').classList.add('hidden');
+  const f = $('upFile').files[0];
+  if (!f) { showUpMsg('bad', 'Choose a file first.'); return; }
+  const fd = new FormData();
+  fd.append('file', f); fd.append('date', $('date').value); fd.append('ignoreLog', $('ignoreLog').checked ? 'true' : 'false');
+  $('btnUpload').disabled = true; showUpMsg('', 'Checking the file...');
+  try {
+    const res = await fetch('/api/upload', { method: 'POST', headers: { 'X-Access-Code': code }, body: fd });
+    if (res.status === 401) { await askCode(true); $('btnUpload').disabled = false; return $('btnUpload').click(); }
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(d.error || ('Upload failed (' + res.status + ')'));
+    showUpMsg('', '');
+    await loadPlan(d.planId);
+    $('planCard').scrollIntoView({ behavior: 'smooth' });
+  } catch (e) { showUpMsg('bad', e.message); }
+  $('btnUpload').disabled = false;
+};
+
 let jobStart = 0;
 const elapsed = () => { const s = Math.floor((Date.now() - jobStart) / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
 
 function startPolling(id, title) {
   jobId = id; nextLine = 0; $('logBox').textContent = ''; jobStart = Date.now();
   $('progressCard').classList.remove('hidden'); $('progressTitle').textContent = title;
-  $('btnPreview').disabled = true; $('btnSend').disabled = true;
+  $('btnPreview').disabled = true; $('btnSend').disabled = true; $('btnUpload').disabled = true;
   clearInterval(pollTimer); pollTimer = setInterval(poll, 1000); poll();
 }
 
@@ -279,7 +361,7 @@ async function poll() {
   }
   if (j.state === 'Running') return;
 
-  clearInterval(pollTimer); $('btnPreview').disabled = false;
+  clearInterval(pollTimer); $('btnPreview').disabled = false; $('btnUpload').disabled = false;
   if (j.state === 'Failed') { showMsg('bad', 'Failed: ' + j.error); $('progressCard').classList.add('hidden'); return; }
   if (isSend) showResult(j); else { $('progressCard').classList.add('hidden'); loadPlan(j.planId); }
 }
@@ -288,7 +370,7 @@ async function poll() {
 async function loadPlan(id) {
   try { plan = await api('/plans/' + id); } catch (e) { showMsg('bad', e.message); return; }
   $('planCard').classList.remove('hidden');
-  $('planTitle').textContent = '- push date ' + plan.pushDate + (plan.limit ? ` - test limit ${plan.limit}` : '') + (plan.ignoreLog ? ' - resending already sent meters' : '');
+  $('planTitle').textContent = '- push date ' + plan.pushDate + (plan.fileName ? ` - file ${plan.fileName}` : '') + (plan.limit ? ` - test limit ${plan.limit}` : '') + (plan.ignoreLog ? ' - resending already sent meters' : '');
   $('stSend').textContent = plan.toSend; $('stDone').textContent = plan.alreadySent; $('stSkip').textContent = plan.skipped;
   $('breakdown').innerHTML = (plan.quick
     ? `<div class="muted small" style="margin-bottom:6px"><b>Quick test:</b> only ${plan.examined} meter(s) were checked (until ${plan.limit} were ready), so the counts below are not for the whole day. Leave the test box empty for the full run.</div>` : '')
@@ -296,10 +378,14 @@ async function loadPlan(id) {
     ? '<b>Why meters are skipped:</b> ' + plan.skippedBreakdown.map(b => `${esc(b.reason)} (${b.count})`).join(' &middot; ') : '');
   $('btnSend').disabled = plan.toSend === 0 || plan.sent;
   $('sendHint').textContent = plan.toSend === 0 ? 'Nothing to send for this date.' : `Sends ${plan.toSend} record(s) one by one, then shows the result.`;
-  $('search').value = ''; view = 'send'; page = 0; setTabs(); loadRows();
+  // open on the tab that has the records (e.g. an upload whose meters were all sent before)
+  $('search').value = ''; page = 0;
+  view = plan.toSend > 0 ? 'send' : plan.alreadySent > 0 ? 'done' : plan.skipped > 0 ? 'skip' : 'send';
+  setTabs(); loadRows();
 }
-function setTabs() { $('tabSend').classList.toggle('on', view === 'send'); $('tabSkip').classList.toggle('on', view === 'skip'); }
+function setTabs() { $('tabSend').classList.toggle('on', view === 'send'); $('tabDone').classList.toggle('on', view === 'done'); $('tabSkip').classList.toggle('on', view === 'skip'); }
 $('tabSend').onclick = () => { view = 'send'; page = 0; setTabs(); loadRows(); };
+$('tabDone').onclick = () => { view = 'done'; page = 0; setTabs(); loadRows(); };
 $('tabSkip').onclick = () => { view = 'skip'; page = 0; setTabs(); loadRows(); };
 let st; $('search').oninput = () => { clearTimeout(st); st = setTimeout(() => { page = 0; loadRows(); }, 300); };
 $('prev').onclick = () => { if (page > 0) { page--; loadRows(); } };
@@ -307,9 +393,9 @@ $('next').onclick = () => { page++; loadRows(); };
 
 async function loadRows() {
   const q = encodeURIComponent($('search').value);
-  const d = await api(`/plans/${plan.planId}/${view === 'send' ? 'records' : 'skipped'}?skip=${page * PAGE}&take=${PAGE}&q=${q}`);
+  const d = await api(`/plans/${plan.planId}/${view === 'skip' ? 'skipped' : 'records'}?skip=${page * PAGE}&take=${PAGE}&q=${q}${view === 'done' ? '&which=done' : ''}`);
   const t = $('planTable');
-  if (view === 'send') {
+  if (view !== 'skip') {
     t.innerHTML = '<tr><th>Service no</th><th>Unique no (ukscno)</th><th>Meter</th><th>Reading time</th><th>Closing kWh</th><th>Consumed</th><th>MD kVA</th><th>MD kW</th><th></th></tr>' +
       d.rows.map(r => `<tr class="click" data-s="${esc(r.serviceNo)}"><td>${esc(r.serviceNo)}</td><td>${esc(r.ukscno)}</td><td>${esc(r.meterNo)}</td><td>${esc(r.dateTime)}</td><td>${esc(r.closingKwh)}</td><td>${esc(r.consumedUnits)}</td><td>${esc(r.rmdKva)}</td><td>${esc(r.rmdKwh)}</td><td>${r.alreadySent ? '<span class="pill OK">sent before</span>' : ''}</td></tr>`).join('');
     t.querySelectorAll('tr.click').forEach(tr => tr.onclick = () => showPlanDetail(tr.dataset.s));
@@ -334,9 +420,10 @@ const kv = pairs => '<div class="kv">' + pairs.map(([k, v]) => `<div>${esc(k)}</
 $('detailClose').onclick = () => $('detailModal').classList.add('hidden');
 
 $('btnDl').onclick = async () => {
-  const res = await api(`/plans/${plan.planId}/download/${view === 'send' ? 'records' : 'skipped'}`, { raw: true });
+  const what = view === 'skip' ? 'skipped' : view === 'done' ? 'done' : 'records';
+  const res = await api(`/plans/${plan.planId}/download/${what}`, { raw: true });
   const blob = await res.blob(); const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob); a.download = `monthly_${view === 'send' ? 'records' : 'skipped'}_${plan.pushDate}.csv`; a.click();
+  a.href = URL.createObjectURL(blob); a.download = `monthly_${what}_${plan.pushDate}.csv`; a.click();
 };
 
 // ---------- run: send
@@ -354,6 +441,15 @@ $('confirmYes').onclick = async () => {
 };
 $('btnStop').onclick = async () => { $('btnStop').disabled = true; await api(`/jobs/${jobId}/stop`, { method: 'POST' }); };
 
+function failHint(f) {
+  const r = (f.reply || '').toLowerCase();
+  if (r.includes('un-successful:null')) return 'The vendor gives no detail. In our tests this reply came whenever a required value was missing or empty.' + (f.emptyFields.length ? ' This request had no value for the fields listed.' : ' All fields had a value, so check them against a working record.');
+  if (r.includes('ora-00917')) return 'The vendor database rejected the request (missing comma): usually an empty element or a value in the wrong format.';
+  if (r.includes('ora-00984') || r.includes('ora-')) return 'The vendor database rejected a value (usually text that needed quotes, or a wrong format).';
+  if (r.startsWith('http')) return 'The vendor server returned an error - try again later.';
+  return f.meaning || '';
+}
+
 function showResult(j) {
   $('progressCard').classList.add('hidden'); $('resultCard').classList.remove('hidden');
   const bad = j.failed > 0 || j.stoppedBecause;
@@ -361,7 +457,12 @@ function showResult(j) {
     `<div class="msg ${bad ? 'warn' : 'ok'}">${j.stoppedBecause ? 'Stopped: ' + esc(j.stoppedBecause) + '. ' : ''}Accepted <b>${j.pushed}</b>, failed <b>${j.failed}</b>, of ${j.total} planned. Run Preview again to see what is left; failed meters are retried automatically.</div>` +
     (j.replies.length ? '<div class="scroll"><table><tr><th>API reply</th><th>Meaning</th><th>Meters</th></tr>' +
       j.replies.map(r => `<tr><td>${esc(r.reply)}</td><td>${esc(r.meaning)}</td><td>${r.count}</td></tr>`).join('') + '</table></div>' : '') +
-    '<p class="small muted">Every record and the reply is saved - see the History tab.</p>';
+    (j.failures && j.failures.length
+      ? '<h3 style="margin:16px 0 6px;font-size:15px">Why meters failed</h3><div class="scroll"><table><tr><th>Service no</th><th>Unique no</th><th>API reply</th><th>What it usually means</th><th>Fields left out of the request (no value)</th></tr>' +
+        j.failures.map(f => `<tr><td>${esc(f.serviceNo)}</td><td>${esc(f.ukscno)}</td><td>${esc(f.reply)}</td><td class="wrap">${esc(failHint(f))}</td><td class="wrap">${f.emptyFields.length ? '<b>' + esc(f.emptyFields.join(', ')) + '</b>' : '-'}</td></tr>`).join('') + '</table></div>'
+      : '') +
+    '<details open style="margin-top:12px"><summary class="small muted" style="cursor:pointer">Show log</summary><pre>' + esc($('logBox').textContent) + '</pre></details>' +
+    '<p class="small muted">Every record and the reply is saved - see the History tab (click a row to see the full request).</p>';
 }
 
 // ---------- history

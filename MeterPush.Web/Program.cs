@@ -45,6 +45,40 @@ api.MapPost("/preview", (PreviewReq req) =>
     return job == null ? Results.Conflict(new { error }) : Results.Ok(new { jobId = job.Id });
 });
 
+// ---- send from an uploaded file (.xlsx / .csv): becomes a plan, then Check the preview -> Send as usual
+api.MapGet("/upload/info", () =>
+{
+    var i = Runner.UploadInfo(connStr);
+    return Results.Ok(new { required = i.Required, optional = i.Optional.Select(o => new { name = o.Name, standard = o.Default }) });
+});
+
+api.MapGet("/upload/template", () =>
+{
+    var i = Runner.UploadInfo(connStr);
+    var bytes = new UTF8Encoding(true).GetPreamble().Concat(Encoding.UTF8.GetBytes(string.Join(",", i.All) + "\r\n")).ToArray();
+    return Results.File(bytes, "text/csv", "setMonthly_upload_template.csv");
+});
+
+api.MapPost("/upload", async (HttpRequest req) =>
+{
+    if (!req.HasFormContentType) return Results.BadRequest(new { error = "Choose a file to upload." });
+    var form = await req.ReadFormAsync();
+    var file = form.Files.FirstOrDefault();
+    if (file == null || file.Length == 0) return Results.BadRequest(new { error = "Choose a file to upload." });
+    if (!DateTime.TryParseExact(form["date"].ToString(), "yyyy-MM-dd", null, System.Globalization.DateTimeStyles.None, out var date))
+        return Results.BadRequest(new { error = "Push date must be yyyy-MM-dd." });
+    try
+    {
+        using var stream = file.OpenReadStream();
+        var rows = UploadFile.Read(file.FileName, stream);
+        var notes = new List<string>();
+        var sp = Runner.PlanUpload(connStr, date, form["ignoreLog"].ToString() == "true", rows, file.FileName, notes);
+        return Results.Ok(new { planId = sp.Id, notes });
+    }
+    catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
+    catch (System.Xml.XmlException) { return Results.BadRequest(new { error = "This does not look like a valid .xlsx file." }); }
+});
+
 api.MapGet("/jobs/active", () => Runner.Active is { } j ? Results.Ok(new { jobId = j.Id, kind = j.Kind }) : Results.Ok(new { jobId = (string?)null }));
 
 api.MapGet("/jobs/{id}", (string id, int? from) =>
@@ -58,6 +92,7 @@ api.MapGet("/jobs/{id}", (string id, int? from) =>
         id = j.Id, kind = j.Kind, state = j.State, pushDate = j.PushDate, started = j.Started, finished = j.Finished,
         planId = j.PlanId, error = j.Error, total = j.Total, index = j.Index, pushed = j.Pushed, failed = j.Failed,
         replies = j.Replies.OrderByDescending(r => r.Value).Select(r => new { reply = r.Key, count = r.Value, meaning = ReplyMeaning(r.Key) }),
+        failures = FailuresOf(j).Select(f => new { serviceNo = f.ServiceNo, ukscno = f.Unique, reply = f.Reply, meaning = ReplyMeaning(f.Reply), emptyFields = f.Empty }),
         stoppedBecause = j.StoppedBecause, lines, nextLine = start + lines.Length
     });
 });
@@ -78,17 +113,19 @@ api.MapGet("/plans/{id}", (string id) =>
     return Results.Ok(new
     {
         planId = sp.Id, pushDate = p.PushDate.ToString("yyyy-MM-dd"), endpoint = p.Endpoint, created = sp.Created, sent = sp.Sent,
-        toSend = p.ToSend.Count, alreadySent = p.Items.Count(i => i.Done), skipped = p.NewSkips,
-        limit = sp.Opts.Limit, ignoreLog = sp.Opts.IgnoreLog, quick = p.Quick, examined = p.Examined,
-        skippedBreakdown = p.Skips.Where(s => !s.Done).GroupBy(s => SkipLabel(s.Why))
+        toSend = p.ToSend.Count, alreadySent = p.Items.Count(i => i.Done), skipped = p.FileName != null ? p.Skips.Count : p.NewSkips,
+        limit = sp.Opts.Limit, ignoreLog = sp.Opts.IgnoreLog, quick = p.Quick, examined = p.Examined, fileName = p.FileName,
+        skippedBreakdown = p.Skips.Where(s => p.FileName != null || !s.Done).GroupBy(s => SkipLabel(s.Why))
             .OrderByDescending(g => g.Count()).Select(g => new { reason = g.Key, count = g.Count() })
     });
 });
 
-api.MapGet("/plans/{id}/records", (string id, int? skip, int? take, string? q) =>
+api.MapGet("/plans/{id}/records", (string id, int? skip, int? take, string? q, string? which) =>
 {
     if (!Runner.Plans.TryGetValue(id, out var sp)) return Results.NotFound(new { error = "This preview has expired. Run Preview again." });
-    var rows = sp.Plan.ToSend.Where(i => Matches(q, i.ServiceNo, i.Unique, V(i, "meter_no"), V(i, "scno"))).ToList();
+    // which=done: the meters already sent for this push date (not part of this send)
+    var source = which == "done" ? sp.Plan.Items.Where(i => i.Done && !sp.Plan.ToSend.Contains(i)) : sp.Plan.ToSend;
+    var rows = source.Where(i => Matches(q, i.ServiceNo, i.Unique, V(i, "meter_no"), V(i, "scno"))).ToList();
     return Results.Ok(new
     {
         total = rows.Count,
@@ -117,7 +154,7 @@ api.MapGet("/plans/{id}/records/{serviceNo}", (string id, string serviceNo) =>
 api.MapGet("/plans/{id}/skipped", (string id, int? skip, int? take, string? q) =>
 {
     if (!Runner.Plans.TryGetValue(id, out var sp)) return Results.NotFound(new { error = "This preview has expired. Run Preview again." });
-    var rows = sp.Plan.Skips.Where(s => !s.Done && Matches(q, s.ServiceNo, s.Unique, s.Why)).ToList();
+    var rows = sp.Plan.Skips.Where(s => (sp.Plan.FileName != null || !s.Done) && Matches(q, s.ServiceNo, s.Unique, s.Why)).ToList();
     return Results.Ok(new
     {
         total = rows.Count,
@@ -131,15 +168,15 @@ api.MapGet("/plans/{id}/download/{what}", (string id, string what) =>
     if (!Runner.Plans.TryGetValue(id, out var sp)) return Results.NotFound(new { error = "This preview has expired. Run Preview again." });
     var p = sp.Plan;
     var sb = new StringBuilder();
-    if (what == "records")
+    if (what is "records" or "done")
     {
         sb.AppendLine(string.Join(",", p.Prms.Select(x => Csv(x.Name))));
-        foreach (var it in p.ToSend) sb.AppendLine(string.Join(",", p.Prms.Select(x => Csv(SentValue(x, it)))));
+        foreach (var it in what == "done" ? p.Items.Where(i => i.Done && !p.ToSend.Contains(i)) : p.ToSend) sb.AppendLine(string.Join(",", p.Prms.Select(x => Csv(SentValue(x, it)))));
     }
     else if (what == "skipped")
     {
         sb.AppendLine("service_no,unique_service_no,reason");
-        foreach (var s in p.Skips.Where(s => !s.Done)) sb.AppendLine(string.Join(",", new[] { s.ServiceNo, s.Unique ?? "", s.Why }.Select(Csv)));
+        foreach (var s in p.Skips.Where(s => p.FileName != null || !s.Done)) sb.AppendLine(string.Join(",", new[] { s.ServiceNo, s.Unique ?? "", s.Why }.Select(Csv)));
     }
     else return Results.NotFound();
     var bytes = new UTF8Encoding(true).GetPreamble().Concat(Encoding.UTF8.GetBytes(sb.ToString())).ToArray();
@@ -280,8 +317,11 @@ static string SkipLabel(string why)
     if (w.StartsWith("no valid 9-digit")) return "No valid unique service number";
     if (w.StartsWith("service not found")) return "Service not in ServiceDetails";
     if (w.StartsWith("opening or closing")) return "kWh reading missing";
+    if (w.StartsWith("file:")) return w.Contains("no value for") ? "Value missing in the file" : w.Contains("repeats") ? "Repeated in the file" : "Invalid value in the file";
     return "Other";
 }
+
+static FailRow[] FailuresOf(Job j) { lock (j.Failures) return j.Failures.ToArray(); }
 
 static string ReplyMeaning(string reply)
 {
