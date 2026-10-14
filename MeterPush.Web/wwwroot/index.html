@@ -243,7 +243,7 @@ $('btnPreview').onclick = async () => {
   try {
     const r = await api('/preview', { method: 'POST', body: JSON.stringify({
       date: $('date').value, limit: $('limit').value ? +$('limit').value : null, ignoreLog: $('ignoreLog').checked, auto: isAuto() }) });
-    startPolling(r.jobId, isAuto() ? 'Reading the meter data, then sending...' : 'Reading the meter data (about a minute)...');
+    startPolling(r.jobId, isAuto() ? 'Reading the meter data, then sending...' : ($('limit').value ? 'Quick test - reading only the meters needed...' : 'Reading all the meter data (1 to 7 minutes)...'));
   } catch (e) { showMsg('bad', e.message); }
 };
 
@@ -290,8 +290,10 @@ async function loadPlan(id) {
   $('planCard').classList.remove('hidden');
   $('planTitle').textContent = '- push date ' + plan.pushDate + (plan.limit ? ` - test limit ${plan.limit}` : '') + (plan.ignoreLog ? ' - resending already sent meters' : '');
   $('stSend').textContent = plan.toSend; $('stDone').textContent = plan.alreadySent; $('stSkip').textContent = plan.skipped;
-  $('breakdown').innerHTML = plan.skippedBreakdown.length
-    ? '<b>Why meters are skipped:</b> ' + plan.skippedBreakdown.map(b => `${esc(b.reason)} (${b.count})`).join(' &middot; ') : '';
+  $('breakdown').innerHTML = (plan.quick
+    ? `<div class="muted small" style="margin-bottom:6px"><b>Quick test:</b> only ${plan.examined} meter(s) were checked (until ${plan.limit} were ready), so the counts below are not for the whole day. Leave the test box empty for the full run.</div>` : '')
+    + (plan.skippedBreakdown.length
+    ? '<b>Why meters are skipped:</b> ' + plan.skippedBreakdown.map(b => `${esc(b.reason)} (${b.count})`).join(' &middot; ') : '');
   $('btnSend').disabled = plan.toSend === 0 || plan.sent;
   $('sendHint').textContent = plan.toSend === 0 ? 'Nothing to send for this date.' : `Sends ${plan.toSend} record(s) one by one, then shows the result.`;
   $('search').value = ''; view = 'send'; page = 0; setTabs(); loadRows();

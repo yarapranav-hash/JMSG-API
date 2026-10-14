@@ -79,7 +79,7 @@ api.MapGet("/plans/{id}", (string id) =>
     {
         planId = sp.Id, pushDate = p.PushDate.ToString("yyyy-MM-dd"), endpoint = p.Endpoint, created = sp.Created, sent = sp.Sent,
         toSend = p.ToSend.Count, alreadySent = p.Items.Count(i => i.Done), skipped = p.NewSkips,
-        limit = sp.Opts.Limit, ignoreLog = sp.Opts.IgnoreLog,
+        limit = sp.Opts.Limit, ignoreLog = sp.Opts.IgnoreLog, quick = p.Quick, examined = p.Examined,
         skippedBreakdown = p.Skips.Where(s => !s.Done).GroupBy(s => SkipLabel(s.Why))
             .OrderByDescending(g => g.Count()).Select(g => new { reason = g.Key, count = g.Count() })
     });

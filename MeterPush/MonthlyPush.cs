@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Data;
 using System.Diagnostics;
 using System.Globalization;
@@ -35,6 +35,7 @@ class MonthlyPush
     // Command line: plan, write the preview files, then send (or stop after the preview with --dry-run / --csv).
     public bool Run()
     {
+        if (opts.VerifyQuick > 0) return VerifyQuick(opts.VerifyQuick);
         var plan = Plan();
         if (plan.Prms.Count == 0) return true;
 
@@ -85,6 +86,9 @@ class MonthlyPush
         var mdDates = usesMd
             ? Enumerable.Range(0, lookback + 1).Select(i => pushDate.AddDays(-pushDate.Day - i)).Where(d => d >= monthStart).ToList()
             : new List<DateTime>();
+        // a test limit: read only the meters needed instead of every meter (see PlanQuick)
+        if (opts.Limit > 0 && !opts.FullRead) return PlanQuick(prms, pushDate, oldDate, forward, lookback, forwardDates, mdDates);
+
         var results = CallMany(new[] { pushDate, oldDate }.Concat(forwardDates).Concat(mdDates).Distinct().ToList());
 
         var newR = results[pushDate];
@@ -114,9 +118,7 @@ class MonthlyPush
 
         var services = LoadServices();
         var done = LoadDone(pushDate);
-
-        var maxIncreasePct = decimal.Parse(global.GetValueOrDefault("MONTHLY_MAX_INCREASE_PCT", "120"), Inv);
-        var maxMd = decimal.Parse(global.GetValueOrDefault("MONTHLY_MAX_MD", "6"), Inv);
+        var ctx = MakeCtx(prms, pushDate, oldDate, forward, lookback, mdDates, services, done, oldR, prevEndR);
 
         // ---- phase 1: build everything that would be sent (nothing is sent or written to the log yet)
         prmList = prms;
@@ -124,22 +126,45 @@ class MonthlyPush
         if (dataCols == null) Log("setMonthly: dbo.PushData_Monthly not found - sent values will not be stored (run sql\\04_create_PushData_Monthly.sql)");
         var items = new List<Item>();
         var skips = new List<Skipped>();
-        foreach (var (serviceNo, cur) in newR.OrderBy(k => k.Key, StringComparer.Ordinal))
+        Evaluate(newR.OrderBy(k => k.Key, StringComparer.Ordinal), ctx, items, skips);
+
+        // --ignore-log: services already logged OK are sent again too
+        var toSend = items.Where(i => opts.IgnoreLog || !i.Done).Take(limit).ToList();
+        return new PlanResult(pushDate, global["ENDPOINT"], prms, items, skips, toSend);
+    }
+
+    // ------------------------------------------------------------ checks (shared by the full plan and the quick test)
+
+    sealed record EvalCtx(List<Param> Prms, DateTime PushDate, DateTime OldDate, int Forward, int Lookback, List<DateTime> MdDates,
+        Dictionary<string, Svc> Services, HashSet<string> Done, Dictionary<string, Reading> OldR, Dictionary<string, Reading> PrevEndR,
+        decimal MaxIncreasePct, decimal MaxMd);
+
+    EvalCtx MakeCtx(List<Param> prms, DateTime pushDate, DateTime oldDate, int forward, int lookback, List<DateTime> mdDates,
+        Dictionary<string, Svc> services, HashSet<string> done, Dictionary<string, Reading> oldR, Dictionary<string, Reading> prevEndR) =>
+        new(prms, pushDate, oldDate, forward, lookback, mdDates, services, done, oldR, prevEndR,
+            decimal.Parse(global.GetValueOrDefault("MONTHLY_MAX_INCREASE_PCT", "120"), Inv),
+            decimal.Parse(global.GetValueOrDefault("MONTHLY_MAX_MD", "6"), Inv));
+
+    // For each service that has a reading on the push date: apply every rule, then add it to items (will be sent) or skips (with the reason).
+    void Evaluate(IEnumerable<KeyValuePair<string, Reading>> rows, EvalCtx c, List<Item> items, List<Skipped> skips)
+    {
+        var (prms, pushDate, oldDate, forward, lookback, mdDates) = (c.Prms, c.PushDate, c.OldDate, c.Forward, c.Lookback, c.MdDates);
+        foreach (var (serviceNo, cur) in rows)
         {
-            var isDone = done.Contains(serviceNo);
+            var isDone = c.Done.Contains(serviceNo);
             Dictionary<string, string?>? vals = null;
             var info = new Info(null, null, null);
             void Skip(string? u, string why) => skips.Add(new Skipped(serviceNo, u, why, isDone, vals, info));
 
             // ukscno is ServiceDetails.UniqueServiceNo (9 digits); the service must exist in ServiceDetails
-            if (!services.TryGetValue(serviceNo, out var svc)) { Skip(null, "service not found (active) in ServiceDetails"); continue; }
+            if (!c.Services.TryGetValue(serviceNo, out var svc)) { Skip(null, "service not found (active) in ServiceDetails"); continue; }
             if (!Regex.IsMatch(svc.Unique ?? "", @"^\d{9}$")) { Skip(svc.Unique, "no valid 9-digit UniqueServiceNo in ServiceDetails"); continue; }
             var unique = svc.Unique!;
 
             // opening reading: only used for the sanity checks below, it is NOT sent
-            if (!oldR.TryGetValue(serviceNo, out var old)) { Skip(unique, forward > 0 ? $"no reading for {oldDate:yyyy-MM-dd} or the next {forward} day(s) (opening)" : $"no reading for {oldDate:yyyy-MM-dd} (opening)"); continue; }
+            if (!c.OldR.TryGetValue(serviceNo, out var old)) { Skip(unique, forward > 0 ? $"no reading for {oldDate:yyyy-MM-dd} or the next {forward} day(s) (opening)" : $"no reading for {oldDate:yyyy-MM-dd} (opening)"); continue; }
 
-            var prevEnd = prevEndR.GetValueOrDefault(serviceNo);
+            var prevEnd = c.PrevEndR.GetValueOrDefault(serviceNo);
             info = new Info(null, old.GetValueOrDefault(ReadDate), prevEnd?.GetValueOrDefault(ReadDate));
 
             Dictionary<string, string?> values;
@@ -165,26 +190,198 @@ class MonthlyPush
 
             // hold back services whose kWh jumped by more than maxIncreasePct between opening and closing
             // opening 0: any positive closing is an unbounded increase
-            if (openKwh > 0 ? diff / openKwh * 100m > maxIncreasePct : diff > 0)
+            if (openKwh > 0 ? diff / openKwh * 100m > c.MaxIncreasePct : diff > 0)
             {
                 var pctText = openKwh > 0 ? $"{diff / openKwh * 100m:0.##}%" : "n/a (opening 0)";
-                Skip(unique, $"increase {pctText} > {maxIncreasePct}% (opening {openKwh:0.##}, closing {closeKwh:0.##})");
+                Skip(unique, $"increase {pctText} > {c.MaxIncreasePct}% (opening {openKwh:0.##}, closing {closeKwh:0.##})");
                 continue;
             }
 
             // maximum demand above the limit (also catches glitch readings with absurd MD values)
             var tooHigh = new[] { "rmd_kva", "rmd_kwh" }
-                .Where(n => values.TryGetValue(n, out var s) && decimal.TryParse(s, NumberStyles.Any, Inv, out var md) && md > maxMd)
+                .Where(n => values.TryGetValue(n, out var s) && decimal.TryParse(s, NumberStyles.Any, Inv, out var md) && md > c.MaxMd)
                 .Select(n => $"{n} {values[n]}").ToList();
-            if (tooHigh.Count > 0) { Skip(unique, $"{string.Join(", ", tooHigh)} > {maxMd}"); continue; }
+            if (tooHigh.Count > 0) { Skip(unique, $"{string.Join(", ", tooHigh)} > {c.MaxMd}"); continue; }
 
             items.Add(new Item(serviceNo, unique, values,
                 Soap.Envelope(Op, prms.Select(p => (p.Name, Quoted(p, values[p.Name])))), isDone, info));
         }
+    }
 
-        // --ignore-log: services already logged OK are sent again too
+    // ------------------------------------------------------------ quick test (a test limit is set)
+    // The full procedure reads every meter (1-8 minutes). For a test of a few meters it is much faster to read only the
+    // candidate meters, straight from their own modem table, with the same selection rule the procedure uses:
+    // the day's latest row (CRTS) with MDkW and phase current present, and the highest kWh when a service has several.
+    // The same checks (Evaluate) are applied, and candidates are examined until enough pass.
+
+    const int QuickBatch = 20, QuickMaxExamined = 600;
+
+    PlanResult PlanQuick(List<Param> prms, DateTime pushDate, DateTime oldDate, int forward, int lookback, List<DateTime> forwardDates, List<DateTime> mdDates)
+    {
+        var sw = Stopwatch.StartNew();
+        var limit = opts.Limit;
+        Log($"setMonthly: quick test for {limit} record(s) - reading only the meters needed, straight from the meter tables (the full procedure is not run)");
+
+        var services = LoadServices();
+        var done = LoadDone(pushDate);
+        var tables = LoadServiceTables();
+        var oldR = new Dictionary<string, Reading>(StringComparer.Ordinal);
+        var prevEndR = new Dictionary<string, Reading>(StringComparer.Ordinal);
+        var ctx = MakeCtx(prms, pushDate, oldDate, forward, lookback, mdDates, services, done, oldR, prevEndR);
+
+        prmList = prms;
+        dataCols = LoadDataColumns();
+        if (dataCols == null) Log("setMonthly: dbo.PushData_Monthly not found - sent values will not be stored (run sql\\04_create_PushData_Monthly.sql)");
+
+        var candidates = services.Values
+            .Where(s => tables.ContainsKey(s.ServiceNo) && Regex.IsMatch(s.Unique ?? "", @"^\d{9}$") && (opts.IgnoreLog || !done.Contains(s.ServiceNo)))
+            .OrderBy(s => s.ServiceNo, StringComparer.Ordinal).ToList();
+        Log($"setMonthly: {candidates.Count} candidate meter(s) not yet sent; checking them {QuickBatch} at a time until {limit} pass");
+
+        var items = new List<Item>();
+        var skips = new List<Skipped>();
+        int examined = 0, noReading = 0;
+        var parallelism = Math.Max(1, int.Parse(global.GetValueOrDefault("PROC_PARALLELISM", "5")));
+        var openingDates = new[] { oldDate }.Concat(forwardDates).ToList();
+
+        for (int pos = 0; pos < candidates.Count && pos < QuickMaxExamined && items.Count < limit; pos += QuickBatch)
+        {
+            var batch = candidates.Skip(pos).Take(QuickBatch).ToList();
+            var fetched = new (Reading? Cur, Reading? Old, Reading? Prev)[batch.Count];
+            Parallel.For(0, batch.Count, new ParallelOptions { MaxDegreeOfParallelism = parallelism }, i =>
+            {
+                using var conn = new SqlConnection(connStr);
+                conn.Open();
+                var no = batch[i].ServiceNo;
+                var cur = ReadQuick(conn, tables[no], no, pushDate);
+                if (cur == null) return; // no reading on the push date: not a meter of this run
+                Reading? old = null, prev = null;
+                foreach (var d in openingDates) { old = ReadQuick(conn, tables[no], no, d); if (old != null) break; }
+                foreach (var d in mdDates) { prev = ReadQuick(conn, tables[no], no, d); if (prev != null) break; }
+                fetched[i] = (cur, old, prev);
+            });
+
+            for (int i = 0; i < batch.Count && items.Count < limit; i++)
+            {
+                examined++;
+                var no = batch[i].ServiceNo;
+                var (cur, old, prev) = fetched[i];
+                if (cur == null) { noReading++; continue; }
+                if (old != null) oldR[no] = old;
+                if (prev != null) prevEndR[no] = prev;
+                Evaluate(new[] { KeyValuePair.Create(no, cur) }, ctx, items, skips);
+            }
+            Log($"setMonthly: checked {examined} meter(s): {items.Count} ready, {skips.Count} skipped, {noReading} with no reading on {pushDate:yyyy-MM-dd} ({sw.Elapsed.TotalSeconds:0} s)");
+        }
+        if (items.Count < limit) Log($"setMonthly: only {items.Count} meter(s) found after checking {examined} candidate(s)");
+        Log($"setMonthly: quick test done in {sw.Elapsed.TotalSeconds:0} s");
+
         var toSend = items.Where(i => opts.IgnoreLog || !i.Done).Take(limit).ToList();
-        return new PlanResult(pushDate, global["ENDPOINT"], prms, items, skips, toSend);
+        return new PlanResult(pushDate, global["ENDPOINT"], prms, items, skips, toSend) { Quick = true, Examined = examined };
+    }
+
+    // service -> the modem tables that hold its readings (the same tables the procedure walks: active DC -> modem IMEI table)
+    Dictionary<string, List<string>> LoadServiceTables()
+    {
+        var d = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        using var cmd = new SqlCommand(@"
+SELECT SD.ServiceNo, MDM.ModemIMEIno
+FROM ModemDetails MDM
+LEFT OUTER JOIN LogDCDetails DD ON DD.ModemId=MDM.ModemId
+LEFT OUTER JOIN ServiceDetails SD ON SD.DCId=DD.DCId
+INNER JOIN INFORMATION_SCHEMA.TABLES IST ON IST.TABLE_NAME = MDM.ModemIMEIno
+WHERE DD.IsActive=1 AND SD.FeederId IN (6,11,19) AND SD.IsActive=1
+GROUP BY SD.ServiceNo, MDM.ModemIMEIno", db) { CommandTimeout = 300 };
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+        {
+            if (r.IsDBNull(0) || r.IsDBNull(1)) continue;
+            var no = r.GetString(0).Trim();
+            var t = r.GetString(1).Trim();
+            if (!Regex.IsMatch(t, @"^\w+$")) continue; // table names come from the database; only plain names are used
+            if (!d.TryGetValue(no, out var list)) d[no] = list = new List<string>();
+            if (!list.Contains(t)) list.Add(t);
+        }
+        return d;
+    }
+
+    // One service, one day: the same row the procedure returns for it (same column names), or null if it has none.
+    internal static Reading? ReadQuick(SqlConnection conn, List<string> tables, string serviceNo, DateTime date)
+    {
+        var day = date.ToString("yyyy-MM-dd", Inv);
+        var rows = new List<Reading>();
+        foreach (var t in tables)
+        {
+            using var cmd = new SqlCommand($@"
+SELECT [DC SNo], [Service No], [MSN], [Phase Current], [Neutral Current], [Voltage], [Power Factor], [Frequency],
+       [Meter Reading(kWh)], [Meter Reading(kVAh)], [MD kW], [MD kW TS], [MD kVA], [MD kVA TS], [Event Status], [Date & Time]
+FROM (SELECT DD.DCSNo AS [DC SNo], SD.ServiceNo AS [Service No], MD.MeterSNo AS [MSN],
+             DT.NormalPhaseCurrent AS [Phase Current], DT.NeutralCurrent AS [Neutral Current], DT.Voltage AS [Voltage],
+             DT.Signedpowerfactor AS [Power Factor], DT.Frequency AS [Frequency],
+             DT.CumulativeEnergykWh AS [Meter Reading(kWh)], DT.CumulativeEnergykVAh AS [Meter Reading(kVAh)],
+             DT.MDkW AS [MD kW], DT.MDkWTS AS [MD kW TS], DT.MDkVA AS [MD kVA], DT.MDkVATS AS [MD kVA TS], STD.STATUSDESCRIPTION AS [Event Status],
+             CONVERT(VARCHAR(16), DT.REALTIMECLOCKDATEANDTIME, 121) AS [Date & Time],
+             RANK() OVER (PARTITION BY SD.ServiceNo ORDER BY DT.CRTS DESC) AS RK
+      FROM {Br(t)} AS DT
+      LEFT OUTER JOIN ServiceDetails SD ON SD.ServiceConnId=DT.ServiceconnId
+      LEFT OUTER JOIN DCDetails DD ON SD.DCId=DD.DCId
+      LEFT OUTER JOIN MeterDetails MD ON MD.MeterId=DT.MeterId
+      LEFT OUTER JOIN STATUSDETAILS STD ON STD.STATUSCODE=MD.STATUSCODE
+      WHERE DT.REALTIMECLOCKDATEANDTIME BETWEEN @from AND @to
+        AND SD.IsActive=1 AND DT.NORMALPHASECURRENT IS NOT NULL AND DT.MDKW IS NOT NULL AND SD.FEEDERID IN (6,11,19)
+        AND SD.ServiceNo=@sn) A
+WHERE RK=1", conn) { CommandTimeout = 300 };
+            cmd.Parameters.Add("@from", SqlDbType.VarChar, 30).Value = day + " 00:00:00";
+            cmd.Parameters.Add("@to", SqlDbType.VarChar, 30).Value = day + " 23:59:59";
+            cmd.Parameters.Add("@sn", SqlDbType.VarChar, 50).Value = serviceNo;
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                var row = new Reading { [ReadDate] = day };
+                for (int i = 0; i < r.FieldCount; i++)
+                    row[r.GetName(i)] = r.IsDBNull(i) ? null : Convert.ToString(r.GetValue(i), Inv);
+                rows.Add(row);
+            }
+        }
+        // across tables the procedure keeps the row with the highest CumulativeEnergykWh (compared as text), then the latest time
+        return rows
+            .OrderByDescending(r => r.GetValueOrDefault(KwhColumn) == null ? "" : r[KwhColumn]!.TrimEnd(), StringComparer.Ordinal)
+            .ThenByDescending(r => r.GetValueOrDefault("Date & Time") ?? "", StringComparer.Ordinal)
+            .FirstOrDefault();
+    }
+
+    static string Br(string name) => "[" + name.Replace("]", "]]") + "]";
+
+    // --verify-quick N: compares the quick reader with the procedure on N random services (push date and the MD date), prints the differences
+    internal bool VerifyQuick(int n)
+    {
+        var pushDate = opts.Date ?? DateTime.Today;
+        var dates = new[] { pushDate, pushDate.AddDays(-pushDate.Day) }; // push date and the last day of the previous month
+        var tables = LoadServiceTables();
+        var results = CallMany(dates.ToList());
+        var cols = new[] { "MSN", KwhColumn, "Meter Reading(kVAh)", "MD kW", "MD kW TS", "MD kVA", "MD kVA TS", "Date & Time" };
+        int checkedN = 0, bad = 0; var rnd = new Random(12345);
+        foreach (var d in dates)
+        {
+            var sample = results[d].Keys.Where(tables.ContainsKey).OrderBy(_ => rnd.Next()).Take(n).ToList();
+            var noTable = results[d].Keys.Count(k => !tables.ContainsKey(k));
+            Log($"verify {d:yyyy-MM-dd}: procedure returned {results[d].Count} service(s), {noTable} without a mapped table; comparing {sample.Count}");
+            using var conn = new SqlConnection(connStr); conn.Open();
+            var sw = Stopwatch.StartNew();
+            foreach (var no in sample)
+            {
+                checkedN++;
+                var q = ReadQuick(conn, tables[no], no, d);
+                var p = results[d][no];
+                if (q == null) { bad++; Log($"  DIFF {no}: quick reader found no row"); continue; }
+                var diffs = cols.Where(c => (p.GetValueOrDefault(c)?.Trim() ?? "") != (q.GetValueOrDefault(c)?.Trim() ?? ""))
+                    .Select(c => $"{c}: proc='{p.GetValueOrDefault(c)}' quick='{q.GetValueOrDefault(c)}'").ToList();
+                if (diffs.Count > 0) { bad++; Log($"  DIFF {no}: {string.Join("; ", diffs)}"); }
+            }
+            Log($"verify {d:yyyy-MM-dd}: quick reader took {sw.Elapsed.TotalSeconds:0.0} s for {sample.Count} service(s) ({sw.Elapsed.TotalSeconds / Math.Max(1, sample.Count):0.00} s each)");
+        }
+        Log($"verify: {checkedN} compared, {bad} different");
+        return bad == 0;
     }
 
     // ------------------------------------------------------------ execute: send the planned records one by one
@@ -247,6 +444,8 @@ class MonthlyPush
         public List<Skipped> Skips { get; }    // services held back, with the reason
         public List<Item> ToSend { get; }      // what Execute will send
         public int NewSkips => Skips.Count(s => !s.Done);
+        public bool Quick { get; init; }       // quick test: only some meters were read, so the counts are not for the whole day
+        public int Examined { get; init; }     // quick test: how many meters were looked at
         public PlanResult(DateTime pushDate, string endpoint, List<Param> prms, List<Item> items, List<Skipped> skips, List<Item> toSend)
         { PushDate = pushDate; Endpoint = endpoint; Prms = prms; Items = items; Skips = skips; ToSend = toSend; }
     }

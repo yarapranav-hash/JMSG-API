@@ -9,7 +9,9 @@ using Microsoft.Data.SqlClient;
 //   MeterPush                         push hourly + monthly
 //   MeterPush --op hourly|monthly     only one of them
 //   MeterPush --dry-run               print the SOAP requests, send nothing, write nothing
-//   MeterPush --limit 5               push at most 5 rows/services per operation (first test)
+//   MeterPush --limit 5               push at most 5 rows/services per operation (first test; monthly reads only the meters it needs - quick test)
+//   MeterPush --op monthly --limit 5 --full-read   same, but read every meter through the procedure first (slow)
+//   MeterPush --op monthly --date 2026-10-01 --verify-quick 25   check the quick reader against the procedure (read-only)
 //   MeterPush --op monthly --csv f.csv   write everything setMonthly would send to f.csv (+ f_skipped.csv); sends nothing
 //   MeterPush --date 2026-10-01      monthly push date (default: today); opening = this date - 1 month
 //   MeterPush --op monthly --ignore-log   also send services already logged OK for the push date (resend everything)
@@ -131,6 +133,8 @@ static Opts ParseArgs(string[] a)
             case "--ignore-log": o.IgnoreLog = true; break;
             case "--op": o.Op = a[++i].ToLowerInvariant(); break;
             case "--limit": o.Limit = int.Parse(a[++i]); break;
+            case "--full-read": o.FullRead = true; break; // with --limit: read every meter through the procedure instead of the quick test
+            case "--verify-quick": o.VerifyQuick = int.Parse(a[++i]); break; // compare the quick reader with the procedure on N services
             case "--csv": o.Csv = Path.GetFullPath(a[++i]); o.DryRun = true; break;
             case "--date": o.Date = DateTime.ParseExact(a[++i], "yyyy-MM-dd", null); break;
             default: throw new ArgumentException($"Unknown argument {a[i]}");
