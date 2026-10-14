@@ -4,6 +4,7 @@ using Microsoft.Data.SqlClient;
 
 // setHourly (shared by the web app). One call of dbo.PrBLSTotalDCWiseMeterDataInstantDay for the reading date gives the latest
 // reading of every meter for that day; only the meters whose "Date & Time" is exactly the chosen hour (HH:00) are sent, with reading_time = HH:00:00.
+// With a test limit only the meters needed are read, straight from their own modem tables (quick test, same selection rule as the procedure).
 // The field rules (which value comes from which column, which are fixed) are the ones in Fields below.
 // Progress / "already sent" is kept in dbo.PushLog_Hourly (sql\05_create_PushLog_Hourly.sql), one row per (reading date, hour, service).
 class HourlyPush
@@ -51,7 +52,9 @@ class HourlyPush
         public int Limit { get; init; }
         public bool IgnoreLog { get; init; }
         public bool LogReady { get; init; }            // dbo.PushLog_Hourly exists (needed to send)
-        public int ProcRows { get; init; }             // meters the procedure returned for the day
+        public int ProcRows { get; init; }             // meters the procedure returned for the day (full read)
+        public bool Quick { get; init; }               // quick test: only some meters were read, so the counts are not for the whole day
+        public int Examined { get; init; }             // quick test: how many meters were looked at
         public List<HItem> Items { get; init; } = new();   // everything that passed the checks (including meters already sent this hour)
         public List<HSkip> Skips { get; init; } = new();
         public List<HItem> ToSend { get; init; } = new();
@@ -68,6 +71,7 @@ class HourlyPush
 
         var services = LoadServices();
         var done = logReady ? LoadDone(date, hour) : new HashSet<string>(StringComparer.Ordinal);
+        if (limit > 0) return PlanQuick(date, hour, limit, ignoreLog, endpoint, logReady, services, done);
 
         Log($"setHourly: reading all meters for {date:yyyy-MM-dd} through the procedure (1 to 7 minutes)...");
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -80,32 +84,81 @@ class HourlyPush
         Log($"setHourly: the procedure returned {rows.Count} meter(s) in {sw.Elapsed.TotalSeconds:0} s");
 
         var items = new List<HItem>(); var skips = new List<HSkip>();
-        void Skip(string no, string? unique, string why) => skips.Add(new HSkip(no, unique, why));
-        var hourStart = date.Date.AddHours(hour);
-
         foreach (var (no, row) in rows.OrderBy(r => r.Key, StringComparer.Ordinal))
-        {
-            if (!services.TryGetValue(no, out var svc)) { Skip(no, null, "service not found in ServiceDetails (or not active)"); continue; }
-            if (!Regex.IsMatch(svc.Unique ?? "", @"^\d{9}$")) { Skip(no, svc.Unique, "no valid 9-digit UniqueServiceNo in ServiceDetails"); continue; }
-
-            var stamp = row.GetValueOrDefault("Date & Time");
-            if (!DateTime.TryParseExact(stamp?.Trim(), "yyyy-MM-dd HH:mm", Inv, DateTimeStyles.None, out var at)) { Skip(no, svc.Unique, "no Date & Time in the reading"); continue; }
-            if (at != hourStart) { Skip(no, svc.Unique, $"latest reading is at {at:yyyy-MM-dd HH:mm}, not exactly {hour:00}:00"); continue; }
-
-            var values = BuildValues(date, hour, row, svc);
-            var missing = Needed.Where(n => string.IsNullOrWhiteSpace(values[n])).ToList();
-            if (missing.Count > 0) { Skip(no, svc.Unique, "no value in the reading for " + string.Join(", ", missing)); continue; }
-
-            var xml = Soap.Envelope(Op, Fields.Select(f => (f.Name, values[f.Name])));
-            items.Add(new HItem(no, svc.Unique!, values, xml, done.Contains(no), stamp!.Trim()));
-        }
+            Evaluate(no, row, services, done, date, hour, items, skips);
         foreach (var no in services.Keys.Where(k => !rows.ContainsKey(k)).OrderBy(k => k, StringComparer.Ordinal))
-            Skip(no, services[no].Unique, $"no reading for {date:yyyy-MM-dd}");
+            skips.Add(new HSkip(no, services[no].Unique, $"no reading for {date:yyyy-MM-dd}"));
 
         var toSend = items.Where(i => ignoreLog || !i.Done).ToList();
-        if (limit > 0 && toSend.Count > limit) toSend = toSend.Take(limit).ToList();
         Log($"setHourly: {items.Count} meter(s) have their latest reading exactly at {hour:00}:00 - to send {toSend.Count}, already sent {items.Count(i => i.Done)}, skipped {skips.Count}");
-        return new HPlan { Date = date, Hour = hour, Endpoint = endpoint, Limit = limit, IgnoreLog = ignoreLog, LogReady = logReady, ProcRows = rows.Count, Items = items, Skips = skips, ToSend = toSend };
+        return new HPlan { Date = date, Hour = hour, Endpoint = endpoint, IgnoreLog = ignoreLog, LogReady = logReady, ProcRows = rows.Count, Items = items, Skips = skips, ToSend = toSend };
+    }
+
+    // The checks for one meter's latest reading of the day (same for the full read and the quick test).
+    void Evaluate(string no, MonthlyPush.Reading row, Dictionary<string, MonthlyPush.Svc> services, HashSet<string> done,
+        DateTime date, int hour, List<HItem> items, List<HSkip> skips)
+    {
+        void Skip(string? unique, string why) => skips.Add(new HSkip(no, unique, why));
+        if (!services.TryGetValue(no, out var svc)) { Skip(null, "service not found in ServiceDetails (or not active)"); return; }
+        if (!Regex.IsMatch(svc.Unique ?? "", @"^\d{9}$")) { Skip(svc.Unique, "no valid 9-digit UniqueServiceNo in ServiceDetails"); return; }
+
+        var stamp = row.GetValueOrDefault("Date & Time");
+        if (!DateTime.TryParseExact(stamp?.Trim(), "yyyy-MM-dd HH:mm", Inv, DateTimeStyles.None, out var at)) { Skip(svc.Unique, "no Date & Time in the reading"); return; }
+        if (at != date.Date.AddHours(hour)) { Skip(svc.Unique, $"latest reading is at {at:yyyy-MM-dd HH:mm}, not exactly {hour:00}:00"); return; }
+
+        var values = BuildValues(date, hour, row, svc);
+        var missing = Needed.Where(n => string.IsNullOrWhiteSpace(values[n])).ToList();
+        if (missing.Count > 0) { Skip(svc.Unique, "no value in the reading for " + string.Join(", ", missing)); return; }
+
+        var xml = Soap.Envelope(Op, Fields.Select(f => (f.Name, values[f.Name])));
+        items.Add(new HItem(no, svc.Unique!, values, xml, done.Contains(no), stamp!.Trim()));
+    }
+
+    // ------------------------------------------------------------ quick test (a test limit is set)
+    // Only candidate meters are read, straight from their own modem table, with the same selection rule the procedure uses
+    // (MonthlyPush.ReadQuick: the day's latest row, MD kW and phase current present, highest kWh across tables), in batches
+    // until `limit` meters have a reading exactly at the chosen hour and pass the checks.
+
+    const int QuickBatch = 20, QuickMaxExamined = 1500;
+
+    HPlan PlanQuick(DateTime date, int hour, int limit, bool ignoreLog, string endpoint, bool logReady,
+        Dictionary<string, MonthlyPush.Svc> services, HashSet<string> done)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        Log($"setHourly: quick test for {limit} record(s) - reading only the meters needed, straight from the meter tables (the full procedure is not run)");
+        var tables = MonthlyPush.LoadServiceTables(db);
+        var candidates = services.Values
+            .Where(s => tables.ContainsKey(s.ServiceNo) && Regex.IsMatch(s.Unique ?? "", @"^\d{9}$") && (ignoreLog || !done.Contains(s.ServiceNo)))
+            .OrderBy(s => s.ServiceNo, StringComparer.Ordinal).ToList();
+        Log($"setHourly: {candidates.Count} candidate meter(s){(ignoreLog ? "" : " not yet sent this hour")}; checking them {QuickBatch} at a time until {limit} are ready");
+
+        var items = new List<HItem>(); var skips = new List<HSkip>();
+        int examined = 0, noReading = 0;
+        var parallelism = Math.Max(1, int.Parse(global.GetValueOrDefault("PROC_PARALLELISM", "5")));
+
+        for (int pos = 0; pos < candidates.Count && pos < QuickMaxExamined && items.Count < limit; pos += QuickBatch)
+        {
+            var batch = candidates.Skip(pos).Take(QuickBatch).ToList();
+            var fetched = new MonthlyPush.Reading?[batch.Count];
+            Parallel.For(0, batch.Count, new ParallelOptions { MaxDegreeOfParallelism = parallelism }, i =>
+            {
+                using var conn = new SqlConnection(connStr);
+                conn.Open();
+                fetched[i] = MonthlyPush.ReadQuick(conn, tables[batch[i].ServiceNo], batch[i].ServiceNo, date);
+            });
+            for (int i = 0; i < batch.Count && items.Count < limit; i++)
+            {
+                examined++;
+                if (fetched[i] == null) { noReading++; continue; }
+                Evaluate(batch[i].ServiceNo, fetched[i]!, services, done, date, hour, items, skips);
+            }
+            Log($"setHourly: checked {examined} meter(s): {items.Count} ready, {skips.Count} skipped, {noReading} with no reading on {date:yyyy-MM-dd} ({sw.Elapsed.TotalSeconds:0} s)");
+        }
+        if (items.Count < limit) Log($"setHourly: only {items.Count} meter(s) found with a reading at {hour:00}:00 after checking {examined} candidate(s)");
+        Log($"setHourly: quick test done in {sw.Elapsed.TotalSeconds:0} s");
+
+        var toSend = items.Where(i => ignoreLog || !i.Done).Take(limit).ToList();
+        return new HPlan { Date = date, Hour = hour, Endpoint = endpoint, Limit = limit, IgnoreLog = ignoreLog, LogReady = logReady, Quick = true, Examined = examined, Items = items, Skips = skips, ToSend = toSend };
     }
 
     Dictionary<string, string?> BuildValues(DateTime date, int hour, MonthlyPush.Reading row, MonthlyPush.Svc svc)
@@ -144,30 +197,31 @@ class HourlyPush
         Log($"setHourly: pushing {plan.ToSend.Count} record(s) for {plan.Label} to {plan.Endpoint}");
 
         var responses = new Dictionary<string, int>();
-        int pushed = 0, failed = 0, consecutiveFails = 0, index = 0;
-        string? stoppedBecause = null;
-        foreach (var it in plan.ToSend)
-        {
-            if (ct.IsCancellationRequested) { stoppedBecause = "stopped by the user"; Log("setHourly: stopped by the user"); break; }
-            var (ok, detail) = Soap.Post(http, plan.Endpoint, Op, it.Xml);
-            WriteLog(plan.Date, plan.Hour, it, ok ? "OK" : "FAILED", detail);
-            index++;
-            string line;
-            if (ok)
+        int pushed = 0, failed = 0, index = 0;
+        var parallelism = ParallelSend.Parallelism(global);
+        Log($"setHourly: sending {parallelism} record(s) at a time");
+        var stoppedBecause = ParallelSend.Run(plan.ToSend, parallelism, ct,
+            it => Soap.Post(http, plan.Endpoint, Op, it.Xml),
+            (it, ok, detail) => // runs one at a time (see ParallelSend)
             {
-                pushed++; consecutiveFails = 0;
-                responses[detail] = responses.GetValueOrDefault(detail) + 1;
-                line = $"{it.ServiceNo} ({it.Unique}) -> {detail}";
-            }
-            else
-            {
-                failed++; consecutiveFails++;
-                line = $"{it.ServiceNo} ({it.Unique}) FAILED - {detail}";
-            }
-            Log($"setHourly: {line}");
-            onProgress?.Invoke(new MonthlyPush.ExecProgress(index, plan.ToSend.Count, pushed, failed, it.ServiceNo, ok, detail));
-            if (consecutiveFails >= 5) { stoppedBecause = "5 failures in a row"; Log("setHourly: 5 failures in a row - stopping, rerun to retry"); break; }
-        }
+                WriteLog(plan.Date, plan.Hour, it, ok ? "OK" : "FAILED", detail);
+                index++;
+                string line;
+                if (ok)
+                {
+                    pushed++;
+                    responses[detail] = responses.GetValueOrDefault(detail) + 1;
+                    line = $"{it.ServiceNo} ({it.Unique}) -> {detail}";
+                }
+                else
+                {
+                    failed++;
+                    line = $"{it.ServiceNo} ({it.Unique}) FAILED - {detail}";
+                }
+                Log($"setHourly: {line}");
+                onProgress?.Invoke(new MonthlyPush.ExecProgress(index, plan.ToSend.Count, pushed, failed, it.ServiceNo, ok, detail));
+            });
+        if (stoppedBecause != null) Log($"setHourly: {stoppedBecause} - stopping, rerun to retry");
         foreach (var (msg, n) in responses.OrderByDescending(r => r.Value))
             Log($"setHourly: server said '{msg}' for {n} meter(s)");
         Log($"setHourly: done - accepted {pushed}, failed {failed}");

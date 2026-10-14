@@ -196,7 +196,7 @@
         <button class="primary" id="hrPreview">Preview</button>
       </div>
       <p class="muted small" style="margin:10px 0 0" id="hrNote"></p>
-      <p class="muted small" style="margin:6px 0 0">The date and hour start as the current date and hour. <code>reading_time</code> is sent as the hour (for example 12:00:00). Only meters whose latest reading of that day is exactly at that hour (for example 11:00, not 11:30) are sent; the others are listed under Skipped. Reading all meters takes 1 to 7 minutes.</p>
+      <p class="muted small" style="margin:6px 0 0">The date and hour start as the current date and hour. <code>reading_time</code> is sent as the hour (for example 12:00:00). Only meters whose latest reading of that day is exactly at that hour (for example 11:00, not 11:30) are sent; the others are listed under Skipped. Reading all meters takes 1 to 7 minutes; with a test number filled in, only the meters needed are read (seconds).</p>
       <div id="hrMsg"></div>
     </div>
 
@@ -242,16 +242,11 @@
         <div><label for="hhStatus">Outcome</label><select id="hhStatus"><option value="">All</option><option value="OK">Sent (OK)</option><option value="FAILED">Failed</option></select></div>
         <div><label for="hhSearch">Search</label><input type="text" id="hhSearch" placeholder="service, unique no, meter, reply" style="width:240px"></div>
         <button class="primary" id="hhGo">Show</button>
+        <button class="secondary" id="hhDl">Download Excel (.xlsx)</button>
       </div>
       <div class="stats" id="hhStats" style="margin-top:14px"></div>
       <div class="scroll" style="margin-top:12px"><table id="hhTable"></table></div>
       <p class="muted small" id="hhNote">Nothing sent yet from this tab (or the table dbo.PushLog_Hourly is not created yet).</p>
-    </div>
-
-    <div class="card">
-      <h2>Where each value comes from</h2>
-      <p class="muted small" style="margin:0 0 10px">The "procedure" is dbo.PrBLSTotalDCWiseMeterDataInstantDay, called for the reading date. <code>username</code> and <code>password</code> come from the settings.</p>
-      <div class="scroll" style="max-height:none"><table id="hourlyTable"></table></div>
     </div>
   </section>
 </main>
@@ -310,7 +305,7 @@ function askCode(wrong) {
 const showMsg = (kind, text) => { $('runMsg').innerHTML = text ? `<div class="msg ${kind}">${esc(text)}</div>` : ''; };
 
 // ---------- navigation
-$('navRun').onclick = () => nav('run'); $('navHist').onclick = () => { nav('hist'); loadDates(); }; $('navHourly').onclick = () => { nav('hourly'); loadHSlots(); loadHFields(); };
+$('navRun').onclick = () => nav('run'); $('navHist').onclick = () => { nav('hist'); loadDates(); }; $('navHourly').onclick = () => { nav('hourly'); loadHSlots(); };
 function nav(w) {
   $('run').classList.toggle('hidden', w !== 'run'); $('hist').classList.toggle('hidden', w !== 'hist'); $('hourly').classList.toggle('hidden', w !== 'hourly');
   $('navRun').classList.toggle('on', w === 'run'); $('navHist').classList.toggle('on', w === 'hist'); $('navHourly').classList.toggle('on', w === 'hourly');
@@ -318,21 +313,6 @@ function nav(w) {
 }
 
 // ---------- hourly (setHourly)
-const SOURCE_TEXT = src => src === 'date' ? 'current date (dd/MM/yy)' : src === 'time' ? 'the chosen hour, as HH:00:00 (matches the procedure column Date & Time)'
-  : src === 'svc:unique' ? 'ServiceDetails.UniqueServiceNo (same as setMonthly)' : src === 'svc:compact' ? 'Service No without the space (same as setMonthly)'
-  : src.startsWith('proc:') ? 'procedure column "' + src.slice(5) + '"' : src.startsWith('setting:') ? 'setting ' + src.slice(8) : 'fixed value ' + src;
-
-let hFieldsLoaded = false;
-async function loadHFields() {
-  if (hFieldsLoaded) return;
-  try {
-    const f = await api('/hourly/fields');
-    $('hourlyTable').innerHTML = '<tr><th>#</th><th>Field</th><th>Taken from</th></tr>' +
-      f.map((x, i) => `<tr><td class="muted">${i + 1}</td><td><code>${esc(x.name)}</code></td><td>${esc(SOURCE_TEXT(x.source))}</td></tr>`).join('');
-    hFieldsLoaded = true;
-  } catch (e) { $('hourlyTable').innerHTML = '<tr><td class="muted">Could not load: ' + esc(e.message) + '</td></tr>'; }
-}
-
 let hPlan = null, hView = 'send', hPage = 0, hJobId = null, hNext = 0, hTimer = null, hStart = 0;
 const hMsg = (kind, text) => { $('hrMsg').innerHTML = text ? `<div class="msg ${kind}">${esc(text)}</div>` : ''; };
 $('hrDate').value = new Date().toLocaleDateString('sv-SE');
@@ -356,7 +336,7 @@ $('hrPreview').onclick = async () => {
   try {
     const r = await api('/hourly/preview', { method: 'POST', body: JSON.stringify({
       date: $('hrDate').value, hour: +$('hrHour').value, limit: $('hrLimit').value ? +$('hrLimit').value : null, ignoreLog: $('hrIgnore').checked, auto: isHAuto() }) });
-    startHPolling(r.jobId, isHAuto() ? 'Reading the meter data, then sending...' : 'Reading all the meter data (1 to 7 minutes)...');
+    startHPolling(r.jobId, isHAuto() ? 'Reading the meter data, then sending...' : ($('hrLimit').value ? 'Quick test - reading only the meters needed...' : 'Reading all the meter data (1 to 7 minutes)...'));
   } catch (e) { hMsg('bad', e.message); }
 };
 
@@ -396,11 +376,14 @@ async function loadHPlan(id) {
   $('hrPlanCard').classList.remove('hidden');
   $('hrPlanTitle').textContent = '- reading ' + hPlan.label + (hPlan.limit ? ` - test limit ${hPlan.limit}` : '') + (hPlan.ignoreLog ? ' - resending already sent meters' : '');
   $('hrStSend').textContent = hPlan.toSend; $('hrStDone').textContent = hPlan.alreadySent; $('hrStSkip').textContent = hPlan.skipped;
-  $('hrBreakdown').innerHTML = `<div class="muted small" style="margin-bottom:6px">The procedure returned ${hPlan.procRows} meter(s) for the day; ${hPlan.eligible} of them have their latest reading exactly at ${String(hPlan.hour).padStart(2, '0')}:00 and passed the checks.</div>`
+  const hh = String(hPlan.hour).padStart(2, '0') + ':00';
+  $('hrBreakdown').innerHTML = (hPlan.quick
+    ? `<div class="muted small" style="margin-bottom:6px"><b>Quick test:</b> only ${hPlan.examined} meter(s) were checked (until ${hPlan.limit} had a reading exactly at ${hh}), so the counts below are not for the whole day. Leave the test box empty for the full run.</div>`
+    : `<div class="muted small" style="margin-bottom:6px">The procedure returned ${hPlan.procRows} meter(s) for the day; ${hPlan.eligible} of them have their latest reading exactly at ${hh} and passed the checks.</div>`)
     + (hPlan.skippedBreakdown.length ? '<b>Why meters are skipped:</b> ' + hPlan.skippedBreakdown.map(b => `${esc(b.reason)} (${b.count})`).join(' &middot; ') : '')
     + (hPlan.logReady ? '' : '<div class="msg warn">The table dbo.PushLog_Hourly does not exist yet, so Send is disabled. Run sql\\05_create_PushLog_Hourly.sql in SQL Server first, then Preview again.</div>');
   $('hrSend').disabled = hPlan.toSend === 0 || hPlan.sent || !hPlan.logReady;
-  $('hrSendHint').textContent = hPlan.toSend === 0 ? 'Nothing to send for this hour.' : `Sends ${hPlan.toSend} record(s) one by one, then shows the result.`;
+  $('hrSendHint').textContent = hPlan.toSend === 0 ? 'Nothing to send for this hour.' : `Sends ${hPlan.toSend} record(s), several at a time (100 by default), then shows the result.`;
   $('hrSearch').value = ''; hPage = 0;
   hView = hPlan.toSend > 0 ? 'send' : hPlan.alreadySent > 0 ? 'done' : hPlan.skipped > 0 ? 'skip' : 'send';
   setHTabs(); loadHRows();
@@ -471,7 +454,10 @@ function showHResult(j) {
       ? '<h3 style="margin:16px 0 6px;font-size:15px">Why meters failed</h3><div class="scroll"><table><tr><th>Service no</th><th>Unique no</th><th>API reply</th><th>What it usually means</th></tr>' +
         j.failures.map(f => `<tr><td>${esc(f.serviceNo)}</td><td>${esc(f.ukscno)}</td><td>${esc(f.reply)}</td><td class="wrap">${esc(failHint(f))}</td></tr>`).join('') + '</table></div>' : '') +
     '<details open style="margin-top:12px"><summary class="small muted" style="cursor:pointer">Show log</summary><pre>' + esc($('hrLog').textContent) + '</pre></details>' +
+    '<p style="margin:12px 0 4px"><button class="primary" id="hrDlSent">Download Excel of what was sent (with Date &amp; Time from the table)</button></p>' +
     '<p class="small muted">Every record and the reply is saved - see Hourly history below (click a row to see the full request).</p>';
+  // j.pushDate is "yyyy-MM-dd HH:00"
+  $('hrDlSent').onclick = () => downloadHSent(j.pushDate.slice(0, 10), +j.pushDate.slice(11, 13), '', '');
 }
 
 // hourly history
@@ -484,6 +470,13 @@ async function loadHSlots() {
   if (slots.length) loadHHistory(); else { $('hhStats').innerHTML = ''; $('hhTable').innerHTML = ''; }
 }
 $('hhGo').onclick = loadHHistory;
+async function downloadHSent(date, hour, status, q) {
+  const res = await api(`/hourly/history/download?date=${date}&hour=${hour}&status=${status || ''}&q=${encodeURIComponent(q || '')}`, { raw: true });
+  if (!res.ok) { const e = await res.json().catch(() => ({})); alert(e.error || 'Download failed'); return; }
+  const blob = await res.blob(); const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = `hourly_sent_${date}_${String(hour).padStart(2, '0')}.xlsx`; a.click();
+}
+$('hhDl').onclick = () => { const v = $('hhSlot').value; if (!v) return; const [date, hour] = v.split('|'); downloadHSent(date, +hour, $('hhStatus').value, $('hhSearch').value); };
 $('hhSearch').onkeydown = e => { if (e.key === 'Enter') loadHHistory(); };
 async function loadHHistory() {
   const v = $('hhSlot').value; if (!v) return;
@@ -619,7 +612,7 @@ async function loadPlan(id) {
     + (plan.skippedBreakdown.length
     ? '<b>Why meters are skipped:</b> ' + plan.skippedBreakdown.map(b => `${esc(b.reason)} (${b.count})`).join(' &middot; ') : '');
   $('btnSend').disabled = plan.toSend === 0 || plan.sent;
-  $('sendHint').textContent = plan.toSend === 0 ? 'Nothing to send for this date.' : `Sends ${plan.toSend} record(s) one by one, then shows the result.`;
+  $('sendHint').textContent = plan.toSend === 0 ? 'Nothing to send for this date.' : `Sends ${plan.toSend} record(s), several at a time (100 by default), then shows the result.`;
   // open on the tab that has the records (e.g. an upload whose meters were all sent before)
   $('search').value = ''; page = 0;
   view = plan.toSend > 0 ? 'send' : plan.alreadySent > 0 ? 'done' : plan.skipped > 0 ? 'skip' : 'send';

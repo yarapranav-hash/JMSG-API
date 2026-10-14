@@ -219,7 +219,7 @@ api.MapGet("/hourly/plans/{id}", (string id) =>
     {
         planId = sp.Id, label = p.Label, date = p.Date.ToString("yyyy-MM-dd"), hour = p.Hour, endpoint = p.Endpoint, created = sp.Created, sent = sp.Sent,
         toSend = p.ToSend.Count, alreadySent = p.Items.Count(i => i.Done), eligible = p.Items.Count, skipped = p.Skips.Count, procRows = p.ProcRows,
-        limit = p.Limit, ignoreLog = p.IgnoreLog, logReady = p.LogReady,
+        limit = p.Limit, ignoreLog = p.IgnoreLog, logReady = p.LogReady, quick = p.Quick, examined = p.Examined,
         skippedBreakdown = p.Skips.GroupBy(s => HourlySkipLabel(s.Why)).OrderByDescending(g => g.Count()).Select(g => new { reason = g.Key, count = g.Count() })
     });
 });
@@ -368,6 +368,45 @@ ORDER BY PushedOn DESC, ServiceNo", db))
         }
     }
     return Results.Ok(new { counts, rows });
+});
+
+// Excel of what was sent for one date and hour: the meter's "Date & Time" from the table, the API reply and every value of the request
+api.MapGet("/hourly/history/download", (string date, int hour, string? status, string? q) =>
+{
+    if (!DateTime.TryParseExact(date, "yyyy-MM-dd", null, System.Globalization.DateTimeStyles.None, out var d))
+        return Results.BadRequest(new { error = "date must be yyyy-MM-dd" });
+    using var db = new SqlConnection(connStr); db.Open();
+    var rows = new List<string[]>
+    {
+        new[] { "service_no", "unique_service_no", "meter_no", "Date & Time (from the table)", "outcome", "api_reply", "sent_on" }
+            .Concat(HourlyPush.Fields.Select(f => f.Name)).ToArray()
+    };
+    using var c = new SqlCommand(@"
+SELECT ServiceNo, UniqueServiceNo, MeterNo, ReadAt, Status, Detail, PushedOn, RequestXml
+FROM dbo.PushLog_Hourly
+WHERE ReadingDate=@d AND ReadingHour=@h
+  AND (@status IS NULL OR Status=@status)
+  AND (@q IS NULL OR ServiceNo LIKE @like OR UniqueServiceNo LIKE @like OR MeterNo LIKE @like OR Detail LIKE @like)
+ORDER BY ReadAt, ServiceNo", db);
+    c.Parameters.AddWithValue("@d", d); c.Parameters.AddWithValue("@h", (byte)hour);
+    c.Parameters.AddWithValue("@status", string.IsNullOrEmpty(status) ? DBNull.Value : status);
+    c.Parameters.AddWithValue("@q", string.IsNullOrWhiteSpace(q) ? DBNull.Value : q.Trim());
+    c.Parameters.AddWithValue("@like", "%" + (q ?? "").Trim() + "%");
+    using (var r = c.ExecuteReader())
+        while (r.Read())
+        {
+            var sent = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (!r.IsDBNull(7))
+            {
+                try { foreach (var e in System.Xml.Linq.XDocument.Parse(r.GetString(7)).Descendants().Where(e => !e.HasElements)) sent[e.Name.LocalName] = e.Value; }
+                catch (System.Xml.XmlException) { }
+            }
+            string S(int i) => r.IsDBNull(i) ? "" : Convert.ToString(r.GetValue(i), System.Globalization.CultureInfo.InvariantCulture) ?? "";
+            rows.Add(new[] { S(0), S(1), S(2), S(3), S(4), S(5), r.GetDateTime(6).ToString("yyyy-MM-dd HH:mm:ss") }
+                .Concat(HourlyPush.Fields.Select(f => sent.GetValueOrDefault(f.Name) ?? "")).ToArray());
+        }
+    var book = XlsxWriter.Build(new[] { ("Sent", rows) });
+    return Results.File(book, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", $"hourly_sent_{d:yyyy-MM-dd}_{hour:00}.xlsx");
 });
 
 // ------------------------------------------------------------ history screen

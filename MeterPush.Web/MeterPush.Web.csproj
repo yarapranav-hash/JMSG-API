@@ -15,6 +15,7 @@
   <ItemGroup>
     <Compile Include="..\MeterPush\MonthlyPush.cs" Link="Shared\MonthlyPush.cs" />
     <Compile Include="..\MeterPush\HourlyPush.cs" Link="Shared\HourlyPush.cs" />
+    <Compile Include="..\MeterPush\ParallelSend.cs" Link="Shared\ParallelSend.cs" />
     <Compile Include="..\MeterPush\Soap.cs" Link="Shared\Soap.cs" />
     <Compile Include="..\MeterPush\Opts.cs" Link="Shared\Opts.cs" />
   </ItemGroup>

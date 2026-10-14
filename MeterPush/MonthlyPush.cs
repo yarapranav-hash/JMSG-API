@@ -356,7 +356,7 @@ class MonthlyPush
 
         var services = LoadServices();
         var done = LoadDone(pushDate);
-        var tables = LoadServiceTables();
+        var tables = LoadServiceTables(db);
         var oldR = new Dictionary<string, Reading>(StringComparer.Ordinal);
         var prevEndR = new Dictionary<string, Reading>(StringComparer.Ordinal);
         var ctx = MakeCtx(prms, pushDate, oldDate, forward, lookback, mdDates, services, done, oldR, prevEndR);
@@ -413,7 +413,7 @@ class MonthlyPush
     }
 
     // service -> the modem tables that hold its readings (the same tables the procedure walks: active DC -> modem IMEI table)
-    Dictionary<string, List<string>> LoadServiceTables()
+    internal static Dictionary<string, List<string>> LoadServiceTables(SqlConnection db)
     {
         var d = new Dictionary<string, List<string>>(StringComparer.Ordinal);
         using var cmd = new SqlCommand(@"
@@ -489,7 +489,7 @@ WHERE RK=1", conn) { CommandTimeout = 300 };
     {
         var pushDate = opts.Date ?? DateTime.Today;
         var dates = new[] { pushDate, pushDate.AddDays(-pushDate.Day) }; // push date and the last day of the previous month
-        var tables = LoadServiceTables();
+        var tables = LoadServiceTables(db);
         var results = CallMany(dates.ToList());
         var cols = new[] { "MSN", KwhColumn, "Meter Reading(kVAh)", "MD kW", "MD kW TS", "MD kVA", "MD kVA TS", "Date & Time" };
         int checkedN = 0, bad = 0; var rnd = new Random(12345);
@@ -532,31 +532,32 @@ WHERE RK=1", conn) { CommandTimeout = 300 };
         }
 
         var responses = new Dictionary<string, int>(); // server message -> count
-        int pushed = 0, failed = 0, consecutiveFails = 0, index = 0;
-        string? stoppedBecause = null;
-        foreach (var it in plan.ToSend)
-        {
-            if (ct.IsCancellationRequested) { stoppedBecause = "stopped by the user"; Log("setMonthly: stopped by the user"); break; }
-            var (ok, detail) = Soap.Post(http, plan.Endpoint, Op, it.Xml);
-            WriteLog(plan.PushDate, it.ServiceNo, it.Unique, ok ? "OK" : "FAILED", detail);
-            WriteData(plan.PushDate, it.ServiceNo, it.Unique, ok ? "OK" : "FAILED", detail, it.Values, MaskPassword(it.Xml), it.Info);
-            index++;
-            string line;
-            if (ok)
+        int pushed = 0, failed = 0, index = 0;
+        var parallelism = ParallelSend.Parallelism(global);
+        Log($"setMonthly: sending {parallelism} record(s) at a time");
+        var stoppedBecause = ParallelSend.Run(plan.ToSend, parallelism, ct,
+            it => Soap.Post(http, plan.Endpoint, Op, it.Xml),
+            (it, ok, detail) => // runs one at a time (see ParallelSend)
             {
-                pushed++; consecutiveFails = 0;
-                responses[detail] = responses.GetValueOrDefault(detail) + 1;
-                line = $"{it.ServiceNo} ({it.Unique}) -> {detail}";
-            }
-            else
-            {
-                failed++; consecutiveFails++;
-                line = $"{it.ServiceNo} ({it.Unique}) FAILED - {detail}";
-            }
-            Log($"setMonthly: {line}");
-            onProgress?.Invoke(new ExecProgress(index, plan.ToSend.Count, pushed, failed, it.ServiceNo, ok, detail));
-            if (consecutiveFails >= 5) { stoppedBecause = "5 failures in a row"; Log("setMonthly: 5 failures in a row - stopping, rerun to retry"); break; }
-        }
+                WriteLog(plan.PushDate, it.ServiceNo, it.Unique, ok ? "OK" : "FAILED", detail);
+                WriteData(plan.PushDate, it.ServiceNo, it.Unique, ok ? "OK" : "FAILED", detail, it.Values, MaskPassword(it.Xml), it.Info);
+                index++;
+                string line;
+                if (ok)
+                {
+                    pushed++;
+                    responses[detail] = responses.GetValueOrDefault(detail) + 1;
+                    line = $"{it.ServiceNo} ({it.Unique}) -> {detail}";
+                }
+                else
+                {
+                    failed++;
+                    line = $"{it.ServiceNo} ({it.Unique}) FAILED - {detail}";
+                }
+                Log($"setMonthly: {line}");
+                onProgress?.Invoke(new ExecProgress(index, plan.ToSend.Count, pushed, failed, it.ServiceNo, ok, detail));
+            });
+        if (stoppedBecause != null) Log($"setMonthly: {stoppedBecause} - stopping, rerun to retry");
 
         foreach (var (msg, n) in responses.OrderByDescending(r => r.Value))
             Log($"setMonthly: server said '{msg}' for {n} service(s)");
