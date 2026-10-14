@@ -86,13 +86,22 @@
   <section id="run">
     <div class="card">
       <h2>1. Choose what to push</h2>
+      <div class="row" style="margin-bottom:14px">
+        <div>
+          <label>Mode</label>
+          <div class="row" style="gap:20px">
+            <label class="check"><input type="radio" name="mode" value="manual" checked> Manual - preview first, then I check and press Send</label>
+            <label class="check"><input type="radio" name="mode" value="auto"> Automatic - preview and send straight away</label>
+          </div>
+        </div>
+      </div>
       <div class="row">
         <div><label for="date">Push date</label><input type="date" id="date"></div>
         <div><label for="limit">Test with only this many meters (optional)</label><input type="number" id="limit" min="1" placeholder="all" style="width:130px"></div>
         <label class="check"><input type="checkbox" id="ignoreLog"> Also resend meters already sent for this date</label>
         <button class="primary" id="btnPreview">Preview</button>
       </div>
-      <p class="muted small" style="margin:10px 0 0">Preview only reads the meter data and shows what would be sent. Nothing goes to the vendor until you press Send.</p>
+      <p class="muted small" id="modeNote" style="margin:10px 0 0">Preview only reads the meter data and shows what would be sent. Nothing goes to the vendor until you press Send.</p>
       <div id="runMsg"></div>
     </div>
 
@@ -216,12 +225,25 @@ function nav(w) {
 function firstOfMonth() { const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1).toLocaleDateString('sv-SE'); }
 $('date').value = firstOfMonth();
 
+const isAuto = () => document.querySelector('input[name=mode]:checked').value === 'auto';
+function applyMode() {
+  const auto = isAuto();
+  $('btnPreview').textContent = auto ? 'Run now (preview + send)' : 'Preview';
+  $('modeNote').innerHTML = auto
+    ? '<b>Automatic:</b> reads the meter data and then sends to the vendor straight away, with no review step. Meters already sent are not sent again unless you tick "also resend". The result is saved in History.'
+    : 'Preview only reads the meter data and shows what would be sent. Nothing goes to the vendor until you press Send.';
+  try { localStorage.setItem('pushMode', auto ? 'auto' : 'manual'); } catch (e) {}
+}
+document.querySelectorAll('input[name=mode]').forEach(r => r.onchange = applyMode);
+try { if (localStorage.getItem('pushMode') === 'auto') document.querySelector('input[name=mode][value=auto]').checked = true; } catch (e) {}
+applyMode();
+
 $('btnPreview').onclick = async () => {
   showMsg('', ''); $('planCard').classList.add('hidden'); $('resultCard').classList.add('hidden');
   try {
     const r = await api('/preview', { method: 'POST', body: JSON.stringify({
-      date: $('date').value, limit: $('limit').value ? +$('limit').value : null, ignoreLog: $('ignoreLog').checked }) });
-    startPolling(r.jobId, 'Reading the meter data (about a minute)...');
+      date: $('date').value, limit: $('limit').value ? +$('limit').value : null, ignoreLog: $('ignoreLog').checked, auto: isAuto() }) });
+    startPolling(r.jobId, isAuto() ? 'Reading the meter data, then sending...' : 'Reading the meter data (about a minute)...');
   } catch (e) { showMsg('bad', e.message); }
 };
 

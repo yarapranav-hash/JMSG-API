@@ -75,7 +75,8 @@ static class Runner
         return (db, g);
     }
 
-    public static Job? StartPreview(string connStr, DateTime date, int? limit, bool ignoreLog, out string? error) =>
+    // auto = Automatic mode: after the preview is built the records are sent straight away, in the same job (no review step)
+    public static Job? StartPreview(string connStr, DateTime date, int? limit, bool ignoreLog, bool auto, out string? error) =>
         TryStart("preview", date.ToString("yyyy-MM-dd"), job =>
         {
             var (db, global) = Open(connStr);
@@ -89,6 +90,13 @@ static class Runner
             job.Total = plan.ToSend.Count;
             // drop plans older than 3 hours
             foreach (var old in Plans.Values.Where(p => p.Created < DateTime.Now.AddHours(-3))) Plans.TryRemove(old.Id, out _);
+
+            if (!auto) return;
+            if (plan.ToSend.Count == 0) { job.Log("Automatic mode: nothing to send."); return; }
+            lock (sp) sp.Sent = true;
+            job.Kind = "send"; // from here on the page shows the send progress
+            job.Log($"Automatic mode: sending {plan.ToSend.Count} record(s) without a review step.");
+            DoSend(job, connStr, sp);
         }, out error);
 
     public static Job? StartSend(string connStr, StoredPlan sp, out string? error) =>
@@ -96,17 +104,22 @@ static class Runner
         {
             job.PlanId = sp.Id;
             job.Total = sp.Plan.ToSend.Count;
-            var (db, global) = Open(connStr);
-            using var dbScope = db;
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(int.Parse(global.GetValueOrDefault("TIMEOUT_SEC", "60"))) };
-            var opts = new Opts { Op = "monthly", Date = sp.Plan.PushDate, IgnoreLog = sp.Opts.IgnoreLog, Limit = sp.Opts.Limit };
-            var res = new MonthlyPush(db, connStr, http, global, opts, job.Log).Execute(sp.Plan, p =>
-            {
-                job.Index = p.Index; job.Pushed = p.Pushed; job.Failed = p.Failed;
-            }, job.Cts.Token);
-            job.Pushed = res.Pushed; job.Failed = res.Failed;
-            job.Replies = res.Replies;
-            job.StoppedBecause = res.StoppedBecause;
-            job.State = res.StoppedBecause != null ? "Stopped" : "Done";
+            DoSend(job, connStr, sp);
         }, out error);
+
+    static void DoSend(Job job, string connStr, StoredPlan sp)
+    {
+        var (db, global) = Open(connStr);
+        using var dbScope = db;
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(int.Parse(global.GetValueOrDefault("TIMEOUT_SEC", "60"))) };
+        var opts = new Opts { Op = "monthly", Date = sp.Plan.PushDate, IgnoreLog = sp.Opts.IgnoreLog, Limit = sp.Opts.Limit };
+        var res = new MonthlyPush(db, connStr, http, global, opts, job.Log).Execute(sp.Plan, p =>
+        {
+            job.Index = p.Index; job.Pushed = p.Pushed; job.Failed = p.Failed;
+        }, job.Cts.Token);
+        job.Pushed = res.Pushed; job.Failed = res.Failed;
+        job.Replies = res.Replies;
+        job.StoppedBecause = res.StoppedBecause;
+        job.State = res.StoppedBecause != null ? "Stopped" : "Done";
+    }
 }

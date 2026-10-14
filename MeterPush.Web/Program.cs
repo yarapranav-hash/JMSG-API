@@ -41,7 +41,7 @@ api.MapPost("/preview", (PreviewReq req) =>
 {
     if (!DateTime.TryParseExact(req.Date, "yyyy-MM-dd", null, System.Globalization.DateTimeStyles.None, out var date))
         return Results.BadRequest(new { error = "Push date must be yyyy-MM-dd." });
-    var job = Runner.StartPreview(connStr, date, req.Limit is > 0 ? req.Limit : null, req.IgnoreLog, out var error);
+    var job = Runner.StartPreview(connStr, date, req.Limit is > 0 ? req.Limit : null, req.IgnoreLog, req.Auto, out var error);
     return job == null ? Results.Conflict(new { error }) : Results.Ok(new { jobId = job.Id });
 });
 
@@ -292,5 +292,5 @@ static string ReplyMeaning(string reply)
     return "";
 }
 
-record PreviewReq(string Date, int? Limit, bool IgnoreLog);
+record PreviewReq(string Date, int? Limit, bool IgnoreLog, bool Auto = false);
 record SendReq(int ConfirmCount);
