@@ -8,7 +8,7 @@ BEGIN
     CREATE TABLE dbo.PushRun_Hourly (
         RunId        int IDENTITY(1,1) CONSTRAINT PK_PushRun_Hourly PRIMARY KEY,
         ReadingDate  date          NOT NULL,
-        ReadingHour  tinyint       NOT NULL,   -- the run for 12:02 pushes the readings of 12:00
+        ReadingHour  tinyint       NOT NULL,   -- the run at 20:00 pushes the readings of 19:00
         StartedOn    datetime      NOT NULL CONSTRAINT DF_PushRun_Hourly_Started DEFAULT GETDATE(),
         FinishedOn   datetime      NULL,
         State        varchar(12)   NOT NULL,   -- Running | Passed | Partial | Failed | Nothing | Missed

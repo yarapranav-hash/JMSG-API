@@ -59,11 +59,22 @@ static class Runner
 
     public static Job? Active { get { lock (Gate) return active is { State: "Running" } ? active : null; } }
 
+    // Keeps memory flat: a plan holds every meter of a run (thousands of requests), the scheduler makes one every hour.
+    // Previews/plans older than 3 hours and jobs (with their log lines) finished more than 6 hours ago are dropped.
+    static void Prune()
+    {
+        var planCut = DateTime.Now.AddHours(-3); var jobCut = DateTime.Now.AddHours(-6);
+        foreach (var p in Plans.Values.Where(p => p.Created < planCut)) Plans.TryRemove(p.Id, out _);
+        foreach (var p in HPlans.Values.Where(p => p.Created < planCut)) HPlans.TryRemove(p.Id, out _);
+        foreach (var j in Jobs.Values.Where(j => j.Finished != null && j.Finished < jobCut)) Jobs.TryRemove(j.Id, out _);
+    }
+
     static Job? TryStart(string kind, string pushDate, Action<Job> work, out string? error, string op = "monthly")
     {
         lock (Gate)
         {
             if (active is { State: "Running" }) { error = $"A {active.Op} {active.Kind} for {active.PushDate} is still running. Wait for it or stop it first."; return null; }
+            Prune();
             var job = new Job { Kind = kind, PushDate = pushDate, Op = op };
             active = job;
             Jobs[job.Id] = job;
@@ -191,9 +202,7 @@ static class Runner
                 using var dbScope = db;
                 using var http = new HttpClient();
                 var plan = new HourlyPush(db, connStr, http, global, job.Log).Plan(date, hour, 0, false);
-                var sp = new StoredHourlyPlan { Plan = plan, Sent = true };
-                HPlans[sp.Id] = sp;
-                job.PlanId = sp.Id;
+                var sp = new StoredHourlyPlan { Plan = plan, Sent = true }; // not kept in HPlans: the Automatic tab reads the results from the database
                 job.Total = plan.ToSend.Count;
                 var already = plan.Items.Count(i => i.Done);
                 RunStore.Update(connStr, runId, "Running", plan.ToSend.Count, already, plan.Skips.Count, 0, 0, null, null, false);

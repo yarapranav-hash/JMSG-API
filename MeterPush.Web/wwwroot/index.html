@@ -127,7 +127,6 @@
       <div class="bar"><div id="bar"></div></div>
       <p class="small" id="progressText" style="margin:8px 0 0"></p>
       <div class="actions" style="justify-content:flex-start"><button class="danger hidden" id="btnStop">Stop</button></div>
-      <details><summary class="small muted" style="cursor:pointer;margin-top:8px">Show log</summary><pre id="logBox"></pre></details>
     </div>
 
     <div class="card hidden" id="planCard">
@@ -198,7 +197,7 @@
         <button class="primary" id="hrPreview">Preview</button>
       </div>
       <p class="muted small" style="margin:10px 0 0" id="hrNote"></p>
-      <p class="muted small" style="margin:6px 0 0">The date and hour start as the current date and hour. <code>reading_time</code> is sent as the hour (for example 12:00:00). Only meters whose latest reading of that day is exactly at that hour (for example 11:00, not 11:30) are sent; the others are listed under Skipped. Reading all meters takes 1 to 7 minutes; with a test number filled in, only the meters needed are read (seconds).</p>
+      <p class="muted small" style="margin:6px 0 0">The date and hour start as the current date and hour. <code>reading_time</code> is sent as the hour (for example 12:00:00). Each meter's reading stamped exactly at that hour (for example 11:00, not 11:30) is sent, even if the meter has reported a later reading since; meters with no reading at that hour are listed under Skipped. Reading all meters takes about a minute; with a test number filled in, only the meters needed are read (seconds).</p>
       <div id="hrMsg"></div>
     </div>
 
@@ -207,7 +206,6 @@
       <div class="bar"><div id="hrBar"></div></div>
       <p class="small" id="hrProgressText" style="margin:8px 0 0"></p>
       <div class="actions" style="justify-content:flex-start"><button class="danger hidden" id="hrStop">Stop</button></div>
-      <details><summary class="small muted" style="cursor:pointer;margin-top:8px">Show log</summary><pre id="hrLog"></pre></details>
     </div>
 
     <div class="card hidden" id="hrPlanCard">
@@ -240,7 +238,10 @@
     <div class="card">
       <h2>Hourly history</h2>
       <div class="row">
-        <div><label for="hhSlot">Date and hour</label><select id="hhSlot" style="min-width:190px"></select></div>
+        <div><label for="hhDate">Date</label><input type="date" id="hhDate"></div>
+        <button class="secondary" id="hhToday">Today</button>
+        <button class="secondary" id="hhYesterday">Yesterday</button>
+        <div><label for="hhSlot">Hour</label><select id="hhSlot" style="min-width:230px"></select></div>
         <div><label for="hhStatus">Outcome</label><select id="hhStatus"><option value="">All</option><option value="OK">Sent (OK)</option><option value="FAILED">Failed</option></select></div>
         <div><label for="hhSearch">Search</label><input type="text" id="hhSearch" placeholder="service, unique no, meter, reply" style="width:240px"></div>
         <button class="primary" id="hhGo">Show</button>
@@ -262,19 +263,30 @@
         <button class="primary" id="scToggle" disabled>...</button>
         <span class="muted small" id="scNext"></span>
       </div>
-      <p class="muted small" style="margin:10px 0 0">When ON, the program pushes the hourly data by itself at <b>2 minutes past every hour</b> (12:02, 13:02 ...). The 12:02 run takes today's date and the <b>12:00</b> readings: only meters whose latest reading is exactly 12:00 are sent, meters already sent for that hour are not sent again. It starts until 29 minutes past if it was busy or the program had just started. It only runs while the program (start-web.bat) is running. Nothing is sent when it is OFF.</p>
+      <p class="muted small" style="margin:10px 0 0">When ON, the program pushes the hourly data by itself at the <b>start of every hour</b> for the <b>previous hour</b>: at 20:00 it pushes the <b>19:00</b> readings, at 21:00 the 20:00 readings, and so on (at 00:00 it pushes 23:00 of the day before). Each meter's reading stamped exactly that hour is sent, whatever later readings (19:30 ...) the meter has; meters already sent for that hour are not sent again. If it was busy or the program had just started, it still starts until the end of that clock hour (59 minutes past). It only runs while the program (start-web.bat) is running. Nothing is sent when it is OFF.</p>
       <div id="scMsg"></div>
       <div id="scRunning" class="msg warn hidden"></div>
     </div>
 
     <div class="card">
-      <h2>Automatic runs <span class="muted small">(updates by itself every 5 seconds)</span></h2>
-      <div class="stats" id="scStats"></div>
+      <h2>Automatic runs <span class="muted small">(updates by itself: every 5 seconds while a run is active, otherwise every 30 seconds)</span></h2>
+      <div class="row">
+        <div><label for="scDate">Date</label><input type="date" id="scDate"></div>
+        <button class="secondary" id="scToday">Today</button>
+        <button class="secondary" id="scYesterday">Yesterday</button>
+        <span class="muted small">Only the runs of the selected date are loaded.</span>
+      </div>
+      <div class="stats" id="scStats" style="margin-top:12px"></div>
       <div class="scroll" style="margin-top:12px;max-height:520px"><table id="scTable"></table></div>
       <p class="muted small" id="scNote">Click a run to see the meters that failed.</p>
     </div>
   </section>
 </main>
+
+<footer style="max-width:1180px;margin:0 auto;padding:0 16px 24px">
+  <div class="muted small" id="diagLine" style="cursor:pointer" title="Click to show the last requests">Timing: waiting for the first request...</div>
+  <pre id="diagList" class="hidden small"></pre>
+</footer>
 
 <!-- access code -->
 <div class="modal hidden" id="codeModal"><div class="box">
@@ -307,10 +319,29 @@ let plan = null, view = 'send', page = 0, jobId = null, nextLine = 0, pollTimer 
 const PAGE = 50;
 
 // ---------- api
+// ---------- timing diagnostics: how long the page and every request took in THIS browser (shown at the bottom of the page)
+const diagLog = [];
+function diagRecord(path, ms, status) {
+  diagLog.push({ t: new Date().toLocaleTimeString('sv-SE'), path: path.split('?')[0], ms: Math.round(ms), status });
+  if (diagLog.length > 40) diagLog.shift();
+  renderDiag();
+}
+function renderDiag() {
+  const n = performance.getEntriesByType('navigation')[0];
+  const last = diagLog[diagLog.length - 1], slow = diagLog.filter(d => d.ms > 3000).length;
+  $('diagLine').textContent = (n ? `Page: server answered in ${Math.round(n.responseEnd - n.requestStart)} ms, loaded in ${Math.round(n.loadEventEnd || n.domContentLoadedEventEnd || n.responseEnd)} ms` : 'Page timing not available')
+    + (last ? ` | last request ${last.path} ${last.ms} ms (HTTP ${last.status})` : '') + (slow ? ` | ${slow} slow request(s) over 3 s` : '');
+  $('diagList').textContent = diagLog.slice().reverse().map(d => `${d.t}  HTTP ${d.status}  ${String(d.ms).padStart(6)} ms  ${d.path}`).join('\n');
+}
 async function api(path, opts = {}) {
-  const res = await fetch('/api' + path, {
-    ...opts, headers: { 'Content-Type': 'application/json', 'X-Access-Code': code, ...(opts.headers || {}) }
-  });
+  const t0 = performance.now();
+  let res;
+  try {
+    res = await fetch('/api' + path, {
+      ...opts, headers: { 'Content-Type': 'application/json', 'X-Access-Code': code, ...(opts.headers || {}) }
+    });
+  } catch (e) { diagRecord(path, performance.now() - t0, 'ERR'); throw e; }
+  diagRecord(path, performance.now() - t0, res.status);
   if (res.status === 401) { await askCode(true); return api(path, opts); }
   if (opts.raw) return res;
   const data = await res.json().catch(() => ({}));
@@ -328,6 +359,9 @@ function askCode(wrong) {
   });
 }
 const showMsg = (kind, text) => { $('runMsg').innerHTML = text ? `<div class="msg ${kind}">${esc(text)}</div>` : ''; };
+
+$('diagLine').onclick = () => $('diagList').classList.toggle('hidden');
+window.addEventListener('load', () => setTimeout(renderDiag, 0));
 
 // ---------- navigation
 $('navRun').onclick = () => nav('run'); $('navHist').onclick = () => { nav('hist'); loadDates(); }; $('navHourly').onclick = () => { nav('hourly'); loadHSlots(); };
@@ -371,19 +405,15 @@ $('hrPreview').onclick = async () => {
 
 const hElapsed = () => { const s = Math.floor((Date.now() - hStart) / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
 function startHPolling(id, title) {
-  hJobId = id; hNext = 0; $('hrLog').textContent = ''; hStart = Date.now();
+  hJobId = id; hNext = 0; hStart = Date.now();
   $('hrProgressCard').classList.remove('hidden'); $('hrProgressTitle').textContent = title;
   $('hrPreview').disabled = true; $('hrSend').disabled = true;
   clearInterval(hTimer); hTimer = setInterval(hPoll, 1000); hPoll();
 }
 async function hPoll() {
   let j;
-  try { j = await api(`/jobs/${hJobId}?from=${hNext}`); }
+  try { j = await api(`/jobs/${hJobId}?lines=0`); }
   catch (e) { $('hrProgressText').textContent = 'Cannot reach the server (' + e.message + ') - retrying. Running for ' + hElapsed(); return; }
-  if (j.lines.length) {
-    const box = $('hrLog'); const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
-    box.textContent += j.lines.join('\n') + '\n'; hNext = j.nextLine; if (atEnd) box.scrollTop = box.scrollHeight;
-  }
   const isSend = j.kind === 'send';
   $('hrStop').classList.toggle('hidden', !(isSend && j.state === 'Running'));
   if (isSend) {
@@ -408,7 +438,7 @@ async function loadHPlan(id) {
   const hh = String(hPlan.hour).padStart(2, '0') + ':00';
   $('hrBreakdown').innerHTML = (hPlan.quick
     ? `<div class="muted small" style="margin-bottom:6px"><b>Quick test:</b> only ${hPlan.examined} meter(s) were checked (until ${hPlan.limit} had a reading exactly at ${hh}), so the counts below are not for the whole day. Leave the test box empty for the full run.</div>`
-    : `<div class="muted small" style="margin-bottom:6px">The procedure returned ${hPlan.procRows} meter(s) for the day; ${hPlan.eligible} of them have their latest reading exactly at ${hh} and passed the checks.</div>`)
+    : `<div class="muted small" style="margin-bottom:6px">${hPlan.procRows} meter(s) have a reading stamped exactly ${hh}; ${hPlan.eligible} of them passed the checks.</div>`)
     + (hPlan.skippedBreakdown.length ? '<b>Why meters are skipped:</b> ' + hPlan.skippedBreakdown.map(b => `${esc(b.reason)} (${b.count})`).join(' &middot; ') : '')
     + (hPlan.logReady ? '' : '<div class="msg warn">The table dbo.PushLog_Hourly does not exist yet, so Send is disabled. Run sql\\05_create_PushLog_Hourly.sql in SQL Server first, then Preview again.</div>');
   $('hrSend').disabled = hPlan.toSend === 0 || hPlan.sent || !hPlan.logReady;
@@ -482,7 +512,6 @@ function showHResult(j) {
     (j.failures && j.failures.length
       ? '<h3 style="margin:16px 0 6px;font-size:15px">Why meters failed</h3><div class="scroll"><table><tr><th>Service no</th><th>Unique no</th><th>API reply</th><th>What it usually means</th></tr>' +
         j.failures.map(f => `<tr><td>${esc(f.serviceNo)}</td><td>${esc(f.ukscno)}</td><td>${esc(f.reply)}</td><td class="wrap">${esc(failHint(f))}</td></tr>`).join('') + '</table></div>' : '') +
-    '<details open style="margin-top:12px"><summary class="small muted" style="cursor:pointer">Show log</summary><pre>' + esc($('hrLog').textContent) + '</pre></details>' +
     '<p style="margin:12px 0 4px"><button class="primary" id="hrDlSent">Download Excel of what was sent (with Date &amp; Time from the table)</button> ' +
     (j.failed > 0 ? '<button class="danger" id="hrDlFail">Download Excel of the failed meters</button>' : '') + '</p>' +
     '<p class="small muted">Every record and the reply is saved - see Hourly history below (click a row to see the full request).</p>';
@@ -491,21 +520,28 @@ function showHResult(j) {
   if ($('hrDlFail')) $('hrDlFail').onclick = () => downloadHSent(j.pushDate.slice(0, 10), +j.pushDate.slice(11, 13), 'FAILED', '');
 }
 
-// hourly history
+// hourly history: only the selected date is loaded (Today / Yesterday buttons or any date)
+const dayStr = offset => { const d = new Date(); d.setDate(d.getDate() + offset); return d.toLocaleDateString('sv-SE'); };
+$('hhDate').value = dayStr(0);
+$('hhToday').onclick = () => { $('hhDate').value = dayStr(0); loadHSlots(); };
+$('hhYesterday').onclick = () => { $('hhDate').value = dayStr(-1); loadHSlots(); };
+$('hhDate').onchange = () => loadHSlots();
 async function loadHSlots() {
+  const date = $('hhDate').value; if (!date) return;
   let slots = [];
-  try { slots = await api('/hourly/history/slots'); } catch (e) { return; }
+  try { slots = await api('/hourly/history/slots?date=' + date); } catch (e) { return; }
   const keep = $('hhSlot').value;
-  $('hhSlot').innerHTML = slots.map(s => `<option value="${s.date}|${s.hour}">${s.date} ${String(s.hour).padStart(2, '0')}:00</option>`).join('');
+  $('hhSlot').innerHTML = slots.map(s => `<option value="${s.date}|${s.hour}">${hhmm(s.hour)} - ${s.ok} sent${s.failed ? ', ' + s.failed + ' failed' : ''}</option>`).join('');
   if (keep && [...$('hhSlot').options].some(o => o.value === keep)) $('hhSlot').value = keep;
-  if (slots.length) loadHHistory(); else { $('hhStats').innerHTML = ''; $('hhTable').innerHTML = ''; }
+  if (slots.length) { loadHHistory(); $('hhNote').textContent = ''; }
+  else { $('hhStats').innerHTML = ''; $('hhTable').innerHTML = ''; $('hhNote').textContent = 'Nothing was sent for ' + date + '.'; }
 }
 $('hhGo').onclick = loadHHistory;
 async function downloadHSent(date, hour, status, q) {
   const res = await api(`/hourly/history/download?date=${date}&hour=${hour}&status=${status || ''}&q=${encodeURIComponent(q || '')}`, { raw: true });
   if (!res.ok) { const e = await res.json().catch(() => ({})); alert(e.error || 'Download failed'); return; }
   const blob = await res.blob(); const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob); a.download = `hourly_${status === 'FAILED' ? 'failed' : 'sent'}_${date}_${String(hour).padStart(2, '0')}.xlsx`; a.click();
+  a.href = URL.createObjectURL(blob); a.download = `hourly_${status === 'FAILED' ? 'failed' : status === 'OK' ? 'accepted' : 'sent'}_${date}_${String(hour).padStart(2, '0')}.xlsx`; a.click();
 }
 $('hhDlF').onclick = () => { const v = $('hhSlot').value; if (!v) return; const [date, hour] = v.split('|'); downloadHSent(date, +hour, 'FAILED', ''); };
 $('hhDl').onclick = () => { const v = $('hhSlot').value; if (!v) return; const [date, hour] = v.split('|'); downloadHSent(date, +hour, $('hhStatus').value, $('hhSearch').value); };
@@ -518,11 +554,16 @@ async function loadHHistory() {
   $('hhStats').innerHTML = `<div class="stat ok"><b>${c.OK || 0}</b><span>sent (OK)</span></div><div class="stat bad"><b>${c.FAILED || 0}</b><span>failed</span></div>`;
   $('hhTable').innerHTML = '<tr><th>Service no</th><th>Unique no</th><th>Meter</th><th>Reading at</th><th>Outcome</th><th>Meaning</th><th>API reply</th><th>When</th></tr>' +
     d.rows.map((r, i) => `<tr class="click" data-i="${i}"><td>${esc(r.serviceNo)}</td><td>${esc(r.unique)}</td><td>${esc(r.meterNo)}</td><td>${esc(r.readAt)}</td><td><span class="pill ${r.status}">${esc(r.status)}</span></td><td>${esc(r.meaning)}</td><td class="wrap muted">${esc(r.reply)}</td><td>${esc((r.pushedOn || '').replace('T', ' ').slice(0, 19))}</td></tr>`).join('');
-  $('hhTable').querySelectorAll('tr.click').forEach(tr => tr.onclick = () => {
+  $('hhTable').querySelectorAll('tr.click').forEach(tr => tr.onclick = async () => {
     const r = d.rows[+tr.dataset.i];
     $('detailTitle').textContent = 'Service ' + r.serviceNo + ' - ' + date + ' ' + String(hour).padStart(2, '0') + ':00';
-    $('detailBody').innerHTML = `<p class="small"><span class="pill ${esc(r.status)}">${esc(r.status)}</span> &nbsp; ${esc(r.reply)}</p>` + (r.xml ? `<pre>${esc(r.xml)}</pre>` : '');
+    const head = `<p class="small"><span class="pill ${esc(r.status)}">${esc(r.status)}</span> &nbsp; ${esc(r.reply)}</p>`;
+    $('detailBody').innerHTML = head + '<p class="muted small">Loading the request...</p>';
     $('detailModal').classList.remove('hidden');
+    try {
+      const x = await api(`/hourly/history/xml?date=${date}&hour=${hour}&serviceNo=${encodeURIComponent(r.serviceNo)}`);
+      $('detailBody').innerHTML = head + (x.xml ? `<pre>${esc(x.xml)}</pre>` : '<p class="muted small">No request stored.</p>');
+    } catch (e) { $('detailBody').innerHTML = head + `<p class="muted small">Could not load the request: ${esc(e.message)}</p>`; }
   });
   $('hhNote').textContent = `Showing the latest ${d.rows.length} row(s) (max 300).`;
 }
@@ -537,25 +578,29 @@ async function loadSched() {
   if (curTab !== 'sched' || scBusy) return;
   scBusy = true;
   try {
-    const [s, r] = await Promise.all([api('/hourly/scheduler'), api('/hourly/runs?take=72')]);
+    const scDate = $('scDate').value || dayStr(0);
+    const [s, r] = await Promise.all([api('/hourly/scheduler'), api('/hourly/runs?take=72&date=' + scDate)]);
     $('scState').className = 'pill ' + (s.on ? 'OK' : 'SKIPPED'); $('scState').textContent = s.on ? 'Scheduler ON' : 'Scheduler OFF';
     $('scToggle').disabled = false; $('scToggle').textContent = s.on ? 'Switch OFF' : 'Switch ON'; $('scToggle').className = s.on ? 'secondary' : 'primary'; $('scToggle').dataset.on = s.on ? '1' : '';
-    $('scNext').textContent = !s.on ? 'Nothing is sent automatically.' : s.next === 'now' ? 'Due now - starts within a few seconds.' : 'Next run: ' + s.next + ' (server time now ' + s.serverTime + ')';
+    $('scNext').textContent = !s.on ? 'Nothing is sent automatically.' : s.next.startsWith('now') ? 'Due now - starts within a few seconds (' + s.next + ').' : 'Next run: ' + s.next + ' (server time now ' + s.serverTime + ')';
     $('scMsg').innerHTML = s.ready ? '' : '<div class="msg warn">The tables for the automatic runs are missing. Run <b>sql\\05_create_PushLog_Hourly.sql</b> and <b>sql\\06_create_PushRun_Hourly.sql</b> in SQL Server, then refresh this page.</div>';
+    scRunning = !!s.running;
     $('scRunning').classList.toggle('hidden', !s.running);
     if (s.running) $('scRunning').textContent = s.running.kind === 'send'
       ? `Running now for ${s.running.label}: sent ${s.running.index} of ${s.running.total} (accepted ${s.running.pushed}, failed ${s.running.failed})`
       : `Running now for ${s.running.label}: reading the meter data...`;
 
     const rows = r.rows || [];
-    const today = new Date().toLocaleDateString('sv-SE');
-    const td = rows.filter(x => x.date === today);
-    const last = rows[0];
+    // three boxes: the latest push (its accepted and failed counts) and the failures of the whole selected day
+    const last = rows[0];   // rows are only the selected date, newest hour first
+    const failedDay = rows.reduce((a, x) => a + x.failed, 0);
+    const dayWord = scDate === dayStr(0) ? 'today' : 'on ' + scDate;
+    const running = last && last.state === 'Running';
     $('scStats').innerHTML = rows.length
-      ? `<div class="stat"><b>${last ? hhmm(last.hour) : '-'}</b><span>last run: ${last ? esc((RUN_STATE[last.state] || ['', last.state])[1]) : ''}</span></div>` +
-        `<div class="stat ok"><b>${td.reduce((a, x) => a + x.accepted, 0)}</b><span>meters accepted today</span></div>` +
-        `<div class="stat bad"><b>${td.reduce((a, x) => a + x.failed, 0)}</b><span>meters failed today</span></div>` +
-        `<div class="stat warn"><b>${td.filter(x => ['Partial', 'Failed', 'Missed'].includes(x.state)).length}</b><span>runs with problems today</span></div>`
+      ? `<div class="stat ok"><b>${running ? '...' : last.accepted}</b><span>accepted in the latest push<br>(${hhmm(last.hour)} readings${running ? ', still running' : ''})</span></div>` +
+        `<div class="stat bad"><b>${running ? '...' : last.failed}</b><span>failed in the latest push<br>(${hhmm(last.hour)} readings${running ? ', still running' : ''})</span></div>` +
+        `<div class="stat warn"><b>${failedDay}</b><span>failed ${dayWord}, all hours` +
+        `${r.distinctFailed != null ? '<br>(' + r.distinctFailed + ' different meter' + (r.distinctFailed === 1 ? '' : 's') + ')' : ''}</span></div>`
       : '';
     $('scTable').innerHTML = '<tr><th>Reading</th><th>Started</th><th>Took</th><th>Result</th><th>To send</th><th>Accepted</th><th>Failed</th><th>Already sent</th><th>Skipped</th><th>Notes</th></tr>' +
       rows.map((x, i) => {
@@ -563,15 +608,21 @@ async function loadSched() {
         return `<tr class="click" data-i="${i}"><td>${esc(x.date)} <b>${hhmm(x.hour)}</b></td><td>${esc(timeOf(x.started))}</td><td>${took}</td><td>${runPill(x.state)}</td><td>${x.planned}</td><td>${x.accepted}</td><td>${x.failed}</td><td>${x.alreadySent}</td><td>${x.skipped}</td><td class="wrap muted">${esc(x.message || x.replies || '')}</td></tr>`;
       }).join('');
     $('scTable').querySelectorAll('tr.click').forEach(tr => tr.onclick = () => showRun(rows[+tr.dataset.i]));
-    $('scNote').textContent = rows.length ? 'Click a run to see the meters that failed and to download them.' : (s.ready ? 'No automatic run yet.' : '');
+    $('scNote').textContent = rows.length ? 'Click a run to see the meters that failed and to download them.' : (s.ready ? 'No automatic run for ' + scDate + '.' : '');
   } catch (e) { $('scNote').textContent = 'Could not load: ' + e.message; }
   scBusy = false;
 }
-setInterval(loadSched, 5000);
+// refresh every 5 s while a run is active, otherwise every 30 s; not at all while the browser tab is hidden
+let scRunning = false, scTick = 0;
+setInterval(() => { if (document.hidden) return; scTick++; if (scRunning || scTick % 6 === 0) loadSched(); }, 5000);
+$('scDate').value = dayStr(0);
+$('scToday').onclick = () => { $('scDate').value = dayStr(0); loadSched(); };
+$('scYesterday').onclick = () => { $('scDate').value = dayStr(-1); loadSched(); };
+$('scDate').onchange = () => loadSched();
 
 $('scToggle').onclick = async () => {
   const turnOn = !$('scToggle').dataset.on;
-  if (turnOn && !confirm('Switch the scheduler ON?\n\nFrom the next HH:02 the program will send the hourly data to the vendor API by itself, every hour, without asking.')) return;
+  if (turnOn && !confirm('Switch the scheduler ON?\n\nFrom the next full hour the program will send the hourly data to the vendor API by itself, every hour, without asking.')) return;
   try { await api('/hourly/scheduler', { method: 'POST', body: JSON.stringify({ enabled: turnOn }) }); $('scMsg').innerHTML = ''; }
   catch (e) { $('scMsg').innerHTML = `<div class="msg bad">${esc(e.message)}</div>`; return; }
   loadSched();
@@ -581,18 +632,23 @@ async function showRun(r) {
   $('detailTitle').textContent = `Automatic run for ${r.date} ${hhmm(r.hour)}`;
   let html = `<p class="small">${runPill(r.state)} &nbsp; <span class="muted">started ${esc((r.started || '').replace('T', ' ').slice(0, 19))}${r.finished ? ', finished ' + esc(timeOf(r.finished)) : ''}</span></p>` +
     kv([['Meters to send', r.planned], ['Accepted by the API', r.accepted], ['Failed', r.failed], ['Already sent before', r.alreadySent], ['Skipped (not at this hour, missing values ...)', r.skipped], ['API replies', r.replies || ''], ['Notes', r.message || '']]);
-  if (r.failed > 0 || r.state === 'Failed') {
-    try {
-      const d = await api(`/hourly/history?date=${r.date}&hour=${r.hour}&status=FAILED&take=500`);
-      html += `<h3 style="margin:14px 0 6px;font-size:15px">Meters that failed (${d.counts.FAILED || 0})</h3><div class="scroll" style="max-height:260px"><table><tr><th>Service no</th><th>Unique no</th><th>Meter</th><th>Date &amp; Time</th><th>API reply</th></tr>` +
-        d.rows.map(x => `<tr><td>${esc(x.serviceNo)}</td><td>${esc(x.unique)}</td><td>${esc(x.meterNo)}</td><td>${esc(x.readAt)}</td><td class="wrap">${esc(x.reply)}</td></tr>`).join('') + '</table></div>';
-    } catch (e) { html += `<p class="muted small">Could not load the failed list: ${esc(e.message)}</p>`; }
-  }
-  html += '<p style="margin:12px 0 0"><button class="primary" id="rdFail">Download failed meters (Excel)</button> <button class="secondary" id="rdAll">Download everything sent (Excel)</button></p>';
+  // Only the counts are kept for succeeded meters. Nothing is read for the run until its row is clicked; then only the FAILED meters
+  // are loaded (a handful), and the Excel (failed meters only) is built when its button is pressed.
+  html += '<div id="rdList">' + (r.failed > 0 ? '<p class="muted small">Loading the failed meters...</p>' : '<p class="muted small">No failed meters in this run.</p>') + '</div>' +
+    (r.failed > 0 ? '<p style="margin:12px 0 0"><button class="danger" id="rdFail">Download failed meters (Excel)</button></p>' : '');
   $('detailBody').innerHTML = html;
-  $('rdFail').onclick = () => downloadHSent(r.date, r.hour, 'FAILED', '');
-  $('rdAll').onclick = () => downloadHSent(r.date, r.hour, '', '');
   $('detailModal').classList.remove('hidden');
+  if (r.failed > 0) {
+    $('rdFail').onclick = () => downloadHSent(r.date, r.hour, 'FAILED', '');
+    try {
+      const d = await api(`/hourly/history?date=${r.date}&hour=${r.hour}&status=FAILED&take=300`);
+      const total = d.counts.FAILED || 0;
+      $('rdList').innerHTML = `<h3 style="margin:14px 0 6px;font-size:15px">Meters that failed (${total})</h3>` +
+        `<div class="scroll" style="max-height:260px"><table><tr><th>Service no</th><th>Unique no</th><th>Meter</th><th>Date &amp; Time</th><th>API reply</th></tr>` +
+        d.rows.map(x => `<tr><td>${esc(x.serviceNo)}</td><td>${esc(x.unique)}</td><td>${esc(x.meterNo)}</td><td>${esc(x.readAt)}</td><td class="wrap">${esc(x.reply)}</td></tr>`).join('') + '</table></div>' +
+        (total > d.rows.length ? `<p class="muted small">Showing the first ${d.rows.length} of ${total}. The Excel download has all of them.</p>` : '');
+    } catch (e) { $('rdList').innerHTML = `<p class="muted small">Could not load the failed meters: ${esc(e.message)}</p>`; }
+  }
 }
 
 // ---------- run: preview
@@ -636,7 +692,8 @@ async function loadUploadInfo() {
     upLoaded = true;
   } catch (e) { $('upInfo').textContent = 'Could not load the details: ' + e.message; }
 }
-loadUploadInfo();
+// the upload details are fetched only when you open "What must the file contain?" (not on every page load)
+$('upInfo').closest('details').addEventListener('toggle', loadUploadInfo);
 const showUpMsg = (kind, text) => { $('upMsg').innerHTML = text ? `<div class="msg ${kind}">${esc(text)}</div>` : ''; };
 
 $('btnTemplate').onclick = async () => {
@@ -668,7 +725,7 @@ let jobStart = 0;
 const elapsed = () => { const s = Math.floor((Date.now() - jobStart) / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
 
 function startPolling(id, title) {
-  jobId = id; nextLine = 0; $('logBox').textContent = ''; jobStart = Date.now();
+  jobId = id; nextLine = 0; jobStart = Date.now();
   $('progressCard').classList.remove('hidden'); $('progressTitle').textContent = title;
   $('btnPreview').disabled = true; $('btnSend').disabled = true; $('btnUpload').disabled = true;
   clearInterval(pollTimer); pollTimer = setInterval(poll, 1000); poll();
@@ -676,12 +733,8 @@ function startPolling(id, title) {
 
 async function poll() {
   let j;
-  try { j = await api(`/jobs/${jobId}?from=${nextLine}`); }
+  try { j = await api(`/jobs/${jobId}?lines=0`); }
   catch (e) { $('progressText').textContent = 'Cannot reach the server (' + e.message + ') - retrying. Running for ' + elapsed(); return; }
-  if (j.lines.length) {
-    const box = $('logBox'); const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
-    box.textContent += j.lines.join('\n') + '\n'; nextLine = j.nextLine; if (atEnd) box.scrollTop = box.scrollHeight;
-  }
   const isSend = j.kind === 'send';
   $('btnStop').classList.toggle('hidden', !(isSend && j.state === 'Running'));
   if (isSend) {
@@ -798,7 +851,6 @@ function showResult(j) {
         j.failures.map(f => `<tr><td>${esc(f.serviceNo)}</td><td>${esc(f.ukscno)}</td><td>${esc(f.reply)}</td><td class="wrap">${esc(failHint(f))}</td><td class="wrap">${f.emptyFields.length ? '<b>' + esc(f.emptyFields.join(', ')) + '</b>' : '-'}</td></tr>`).join('') + '</table></div>'
       : '') +
     (j.failed > 0 ? '<p style="margin:12px 0 0"><button class="danger" id="btnDlFail">Download failed meters (Excel)</button></p>' : '') +
-    '<details open style="margin-top:12px"><summary class="small muted" style="cursor:pointer">Show log</summary><pre>' + esc($('logBox').textContent) + '</pre></details>' +
     '<p class="small muted">Every record and the reply is saved - see the History tab (click a row to see the full request).</p>';
   if ($('btnDlFail')) $('btnDlFail').onclick = async () => {
     const res = await api(`/jobs/${j.id}/failures/download`, { raw: true });

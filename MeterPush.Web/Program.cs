@@ -13,10 +13,13 @@ var builder = WebApplication.CreateBuilder(args);
 var connStr = builder.Configuration["ConnectionString"] ?? throw new InvalidOperationException("ConnectionString is missing in appsettings.json");
 var accessCode = builder.Configuration["AccessCode"] ?? "";
 builder.Services.AddHostedService(_ => new HourlyScheduler(connStr)); // automatic hourly push (switched on in the Hourly: Automatic tab)
+builder.Services.AddResponseCompression();   // gzip / brotli: the page (65 KB) and the JSON replies travel much smaller over a slow link
 var app = builder.Build();
 
+app.UseResponseCompression();
 app.UseDefaultFiles();
-app.UseStaticFiles();
+// the page is revalidated on every open (a 304 answer is tiny) so a rebuilt page is never served stale
+app.UseStaticFiles(new StaticFileOptions { OnPrepareResponse = ctx => ctx.Context.Response.Headers["Cache-Control"] = "no-cache" });
 
 // every /api call needs the access code (X-Access-Code header)
 app.Use(async (ctx, next) =>
@@ -82,19 +85,21 @@ api.MapPost("/upload", async (HttpRequest req) =>
 
 api.MapGet("/jobs/active", () => Runner.Active is { } j ? Results.Ok(new { jobId = j.Id, kind = j.Kind, op = j.Op, scheduled = j.Scheduled }) : Results.Ok(new { jobId = (string?)null }));
 
-api.MapGet("/jobs/{id}", (string id, int? from) =>
+api.MapGet("/jobs/{id}", (string id, int? from, int? lines) =>
 {
     if (!Runner.Jobs.TryGetValue(id, out var j)) return Results.NotFound(new { error = "Unknown job." });
-    string[] lines;
+    // the page shows only counts and failures; ?lines=0 returns no log lines (the log is still in the console window)
+    string[] lines_;
     var start = Math.Max(0, from ?? 0);
-    lock (j.Lines) lines = j.Lines.Skip(start).ToArray();
+    if (lines == 0) lines_ = Array.Empty<string>();
+    else lock (j.Lines) lines_ = j.Lines.Skip(start).ToArray();
     return Results.Ok(new
     {
         id = j.Id, op = j.Op, kind = j.Kind, state = j.State, pushDate = j.PushDate, started = j.Started, finished = j.Finished,
         planId = j.PlanId, error = j.Error, total = j.Total, index = j.Index, pushed = j.Pushed, failed = j.Failed,
         replies = j.Replies.OrderByDescending(r => r.Value).Select(r => new { reply = r.Key, count = r.Value, meaning = ReplyMeaning(r.Key) }),
         failures = FailuresOf(j).Select(f => new { serviceNo = f.ServiceNo, ukscno = f.Unique, reply = f.Reply, meaning = ReplyMeaning(f.Reply), emptyFields = f.Empty }),
-        stoppedBecause = j.StoppedBecause, lines, nextLine = start + lines.Length
+        stoppedBecause = j.StoppedBecause, lines = lines_, nextLine = start + lines_.Length
     });
 });
 
@@ -333,16 +338,20 @@ api.MapPost("/hourly/plans/{id}/send", (string id, SendReq req) =>
     }
 });
 
-// what was sent before: one list per (reading date, hour)
-api.MapGet("/hourly/history/slots", () =>
+// what was sent before: the hours of ONE reading date (only that date is read), newest hour first, with how many were accepted / failed
+api.MapGet("/hourly/history/slots", (string date) =>
 {
+    if (!DateTime.TryParseExact(date, "yyyy-MM-dd", null, System.Globalization.DateTimeStyles.None, out var d))
+        return Results.BadRequest(new { error = "date must be yyyy-MM-dd" });
     using var db = new SqlConnection(connStr); db.Open();
     var list = new List<object>();
-    using var cmd = new SqlCommand(@"SELECT TOP 100 ReadingDate, ReadingHour FROM dbo.PushLog_Hourly GROUP BY ReadingDate, ReadingHour ORDER BY ReadingDate DESC, ReadingHour DESC", db);
+    using var cmd = new SqlCommand(@"SELECT ReadingHour, SUM(CASE WHEN Status='OK' THEN 1 ELSE 0 END), SUM(CASE WHEN Status='FAILED' THEN 1 ELSE 0 END)
+FROM dbo.PushLog_Hourly WHERE ReadingDate=@d GROUP BY ReadingHour ORDER BY ReadingHour DESC", db);
+    cmd.Parameters.AddWithValue("@d", d);
     try
     {
         using var r = cmd.ExecuteReader();
-        while (r.Read()) list.Add(new { date = r.GetDateTime(0).ToString("yyyy-MM-dd"), hour = (int)r.GetByte(1) });
+        while (r.Read()) list.Add(new { date, hour = (int)r.GetByte(0), ok = r.GetInt32(1), failed = r.GetInt32(2) });
     }
     catch (SqlException) { } // table not created yet
     return Results.Ok(list);
@@ -362,7 +371,7 @@ api.MapGet("/hourly/history", (string date, int hour, string? status, string? q,
         while (r.Read()) counts[r.GetString(0)] = r.GetInt32(1);
     }
     using (var c = new SqlCommand(@"
-SELECT TOP (@take) ServiceNo, UniqueServiceNo, MeterNo, ReadAt, Status, Detail, PushedOn, RequestXml
+SELECT TOP (@take) ServiceNo, UniqueServiceNo, MeterNo, ReadAt, Status, Detail, PushedOn
 FROM dbo.PushLog_Hourly
 WHERE ReadingDate=@d AND ReadingHour=@h
   AND (@status IS NULL OR Status=@status)
@@ -382,11 +391,22 @@ ORDER BY PushedOn DESC, ServiceNo", db))
             {
                 serviceNo = r.GetString(0), unique = r.IsDBNull(1) ? null : r.GetString(1), meterNo = r.IsDBNull(2) ? null : r.GetString(2),
                 readAt = r.IsDBNull(3) ? null : r.GetString(3), status = r.GetString(4), reply = detail, meaning = ReplyMeaning(detail),
-                pushedOn = r.GetDateTime(6), xml = r.IsDBNull(7) ? null : r.GetString(7)
+                pushedOn = r.GetDateTime(6)
             });
         }
     }
     return Results.Ok(new { counts, rows });
+});
+
+// the request XML of one meter is loaded only when its row is opened (it is ~2 KB per meter, too much to send with every list)
+api.MapGet("/hourly/history/xml", (string date, int hour, string serviceNo) =>
+{
+    if (!DateTime.TryParseExact(date, "yyyy-MM-dd", null, System.Globalization.DateTimeStyles.None, out var d))
+        return Results.BadRequest(new { error = "date must be yyyy-MM-dd" });
+    using var db = new SqlConnection(connStr); db.Open();
+    using var c = new SqlCommand("SELECT RequestXml FROM dbo.PushLog_Hourly WHERE ReadingDate=@d AND ReadingHour=@h AND ServiceNo=@n", db);
+    c.Parameters.AddWithValue("@d", d); c.Parameters.AddWithValue("@h", (byte)hour); c.Parameters.AddWithValue("@n", serviceNo);
+    return Results.Ok(new { xml = c.ExecuteScalar() as string });
 });
 
 // ---- automatic runs (scheduler)
@@ -396,12 +416,12 @@ api.MapGet("/hourly/scheduler", () =>
     var ready = RunStore.Ready(connStr);
     var on = SchedulerSetting.IsOn(connStr);
     var now = DateTime.Now;
-    var slot = now.Date.AddHours(now.Hour);
+    var slot = HourlyScheduler.TargetSlot(now);   // the reading hour a run started now is for (the previous hour)
+    var nextStart = now.Date.AddHours(now.Hour + 1);
     string next;
     if (!on) next = "off";
-    else if (now.Minute < HourlyScheduler.Minute) next = slot.AddMinutes(HourlyScheduler.Minute).ToString("yyyy-MM-dd HH:mm");
-    else if (ready && !RunStore.HasRun(connStr, slot.Date, slot.Hour) && now.Minute < HourlyScheduler.WindowEnd) next = "now";
-    else next = slot.AddHours(1).AddMinutes(HourlyScheduler.Minute).ToString("yyyy-MM-dd HH:mm");
+    else if (ready && !RunStore.HasRun(connStr, slot.Date, slot.Hour) && now.Minute < HourlyScheduler.WindowEnd) next = "now for the " + slot.ToString("yyyy-MM-dd HH:mm") + " readings";
+    else next = nextStart.ToString("yyyy-MM-dd HH:mm") + " (for the " + nextStart.AddHours(-1).ToString("yyyy-MM-dd HH:mm") + " readings)";
     var a = Runner.Active is { Op: "hourly" } j ? new { label = j.PushDate, kind = j.Kind, index = j.Index, total = j.Total, pushed = j.Pushed, failed = j.Failed } : null;
     return Results.Ok(new { ready, on, minute = HourlyScheduler.Minute, windowEnd = HourlyScheduler.WindowEnd, next, serverTime = now.ToString("yyyy-MM-dd HH:mm:ss"), running = a });
 });
@@ -414,15 +434,24 @@ api.MapPost("/hourly/scheduler", (SchedulerReq req) =>
     return Results.Ok(new { on = req.Enabled });
 });
 
-api.MapGet("/hourly/runs", (int? take) =>
+api.MapGet("/hourly/runs", (string? date, int? take) =>
 {
     if (!RunStore.Ready(connStr)) return Results.Ok(new { ready = false, rows = Array.Empty<object>() });
-    var rows = RunStore.List(connStr, take ?? 72).Select(r => new
+    DateTime? only = null;
+    if (!string.IsNullOrEmpty(date))
+    {
+        if (!DateTime.TryParseExact(date, "yyyy-MM-dd", null, System.Globalization.DateTimeStyles.None, out var d0))
+            return Results.BadRequest(new { error = "date must be yyyy-MM-dd" });
+        only = d0;
+    }
+    var rows = RunStore.List(connStr, take ?? 72, only).Select(r => new
     {
         runId = r.RunId, date = r.ReadingDate.ToString("yyyy-MM-dd"), hour = r.ReadingHour, started = r.StartedOn, finished = r.FinishedOn, state = r.State,
         planned = r.Planned, alreadySent = r.AlreadySent, skipped = r.Skipped, accepted = r.Accepted, failed = r.Failed, replies = r.Replies, message = r.Message
     });
-    return Results.Ok(new { ready = true, rows });
+    // for the date's summary box: how many DIFFERENT meters failed on that date (the same meter failing every hour counts once)
+    var distinctFailed = only.HasValue ? RunStore.DistinctFailed(connStr, only.Value) : (int?)null;
+    return Results.Ok(new { ready = true, rows, distinctFailed });
 });
 
 // Excel of what was sent for one date and hour: the meter's "Date & Time" from the table, the API reply and every value of the request
@@ -593,7 +622,7 @@ static string HourlySkipLabel(string why)
 {
     var w = why.ToLowerInvariant();
     if (w.StartsWith("latest reading is at")) return "Latest reading is not at the chosen hour";
-    if (w.StartsWith("no reading for")) return "No reading for the day";
+    if (w.StartsWith("no reading at") || w.StartsWith("no reading for")) return "No reading at this hour";
     if (w.StartsWith("no value in the reading")) return "Value missing in the reading";
     if (w.StartsWith("no date & time")) return "No Date & Time in the reading";
     if (w.StartsWith("no valid 9-digit")) return "No valid unique service number";

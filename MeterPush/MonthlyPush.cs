@@ -438,7 +438,7 @@ GROUP BY SD.ServiceNo, MDM.ModemIMEIno", db) { CommandTimeout = 300 };
     }
 
     // One service, one day: the same row the procedure returns for it (same column names), or null if it has none.
-    internal static Reading? ReadQuick(SqlConnection conn, List<string> tables, string serviceNo, DateTime date)
+    internal static Reading? ReadQuick(SqlConnection conn, List<string> tables, string serviceNo, DateTime date, string timeFrom = "00:00:00", string timeTo = "23:59:59")
     {
         var day = date.ToString("yyyy-MM-dd", Inv);
         var rows = new List<Reading>();
@@ -463,8 +463,8 @@ FROM (SELECT DD.DCSNo AS [DC SNo], SD.ServiceNo AS [Service No], MD.MeterSNo AS 
         AND SD.IsActive=1 AND DT.NORMALPHASECURRENT IS NOT NULL AND DT.MDKW IS NOT NULL AND SD.FEEDERID IN (6,11,19)
         AND SD.ServiceNo=@sn) A
 WHERE RK=1", conn) { CommandTimeout = 300 };
-            cmd.Parameters.Add("@from", SqlDbType.VarChar, 30).Value = day + " 00:00:00";
-            cmd.Parameters.Add("@to", SqlDbType.VarChar, 30).Value = day + " 23:59:59";
+            cmd.Parameters.Add("@from", SqlDbType.VarChar, 30).Value = day + " " + timeFrom;
+            cmd.Parameters.Add("@to", SqlDbType.VarChar, 30).Value = day + " " + timeTo;
             cmd.Parameters.Add("@sn", SqlDbType.VarChar, 50).Value = serviceNo;
             using var r = cmd.ExecuteReader();
             while (r.Read())
@@ -482,7 +482,7 @@ WHERE RK=1", conn) { CommandTimeout = 300 };
             .FirstOrDefault();
     }
 
-    static string Br(string name) => "[" + name.Replace("]", "]]") + "]";
+    internal static string Br(string name) => "[" + name.Replace("]", "]]") + "]";
 
     // --verify-quick N: compares the quick reader with the procedure on N random services (push date and the MD date), prints the differences
     internal bool VerifyQuick(int n)
@@ -525,38 +525,36 @@ WHERE RK=1", conn) { CommandTimeout = 300 };
         if (dataCols == null) Log("setMonthly: dbo.PushData_Monthly not found - sent values will not be stored (run sql\\04_create_PushData_Monthly.sql)");
         Log($"setMonthly: pushing {plan.ToSend.Count} record(s) to {plan.Endpoint}");
 
-        foreach (var s in plan.Skips.Where(s => !s.Done))
-        {
-            WriteLog(plan.PushDate, s.ServiceNo, s.Unique, "SKIPPED", s.Why);
-            WriteData(plan.PushDate, s.ServiceNo, s.Unique, "SKIPPED", s.Why, s.Values, null, s.Info);
-        }
-
         var responses = new Dictionary<string, int>(); // server message -> count
         int pushed = 0, failed = 0, index = 0;
-        var parallelism = ParallelSend.Parallelism(global);
-        Log($"setMonthly: sending {parallelism} record(s) at a time");
-        var stoppedBecause = ParallelSend.Run(plan.ToSend, parallelism, ct,
-            it => Soap.Post(http, plan.Endpoint, Op, it.Xml),
-            (it, ok, detail) => // runs one at a time (see ParallelSend)
-            {
-                WriteLog(plan.PushDate, it.ServiceNo, it.Unique, ok ? "OK" : "FAILED", detail);
-                WriteData(plan.PushDate, it.ServiceNo, it.Unique, ok ? "OK" : "FAILED", detail, it.Values, MaskPassword(it.Xml), it.Info);
-                index++;
-                string line;
-                if (ok)
+        string? stoppedBecause;
+        try
+        {
+            foreach (var s in plan.Skips.Where(s => !s.Done))
+                QueueWrite(new PendingWrite(plan.PushDate, s.ServiceNo, s.Unique, "SKIPPED", s.Why, s.Values, null, s.Info));
+
+            var parallelism = ParallelSend.Parallelism(global);
+            Log($"setMonthly: sending {parallelism} record(s) at a time");
+            stoppedBecause = ParallelSend.Run(plan.ToSend, parallelism, ct,
+                it => Soap.Post(http, plan.Endpoint, Op, it.Xml),
+                (it, ok, detail) => // runs one at a time (see ParallelSend)
                 {
-                    pushed++;
-                    responses[detail] = responses.GetValueOrDefault(detail) + 1;
-                    line = $"{it.ServiceNo} ({it.Unique}) -> {detail}";
-                }
-                else
-                {
-                    failed++;
-                    line = $"{it.ServiceNo} ({it.Unique}) FAILED - {detail}";
-                }
-                Log($"setMonthly: {line}");
-                onProgress?.Invoke(new ExecProgress(index, plan.ToSend.Count, pushed, failed, it.ServiceNo, ok, detail));
-            });
+                    QueueWrite(new PendingWrite(plan.PushDate, it.ServiceNo, it.Unique, ok ? "OK" : "FAILED", detail, it.Values, MaskPassword(it.Xml), it.Info));
+                    index++;
+                    if (ok)
+                    {
+                        pushed++;
+                        responses[detail] = responses.GetValueOrDefault(detail) + 1; // accepted meters are only counted (summary at the end)
+                    }
+                    else
+                    {
+                        failed++;
+                        Log($"setMonthly: {it.ServiceNo} ({it.Unique}) FAILED - {detail}");
+                    }
+                    onProgress?.Invoke(new ExecProgress(index, plan.ToSend.Count, pushed, failed, it.ServiceNo, ok, detail));
+                });
+        }
+        finally { FlushWrites(); } // whatever was sent is saved even when the run stops or fails
         if (stoppedBecause != null) Log($"setMonthly: {stoppedBecause} - stopping, rerun to retry");
 
         foreach (var (msg, n) in responses.OrderByDescending(r => r.Value))
@@ -602,39 +600,98 @@ WHERE RK=1", conn) { CommandTimeout = 300 };
         return set.Count == 0 ? null : set;
     }
 
-    // One row per (push date, service): every value as sent (or as it was built, for skipped services), the reply and the request XML.
-    void WriteData(DateTime pushDate, string serviceNo, string? unique, string outcome, string reply,
-        Dictionary<string, string?>? values, string? xml, Info info)
-    {
-        if (dataCols == null) return;
-        var cols = prmList.Where(p => !p.Name.Equals("password", StringComparison.OrdinalIgnoreCase) && dataCols.Contains(p.Name)).ToList();
+    // ---- result writes are batched: one database round trip per chunk of records instead of two per record.
+    // Per record: the PushLog_Monthly row (status + reply) and, when the table exists, the PushData_Monthly row
+    // (every value as sent - or as it was built, for skipped services - the reply and the request XML). Same statements as one-at-a-time.
+#pragma warning disable CS0649 // Tx is only set by tests
+    internal SqlTransaction? Tx;   // set by tests only (so a test can roll everything back)
+#pragma warning restore CS0649
+    sealed record PendingWrite(DateTime PushDate, string ServiceNo, string? Unique, string Status, string Detail,
+        Dictionary<string, string?>? Values, string? Xml, Info Info);
+    readonly List<PendingWrite> pendingWrites = new();
+    DateTime lastFlush = DateTime.UtcNow;
+    const int ParamBudget = 2000; // SQL Server allows 2,100 parameters per command
 
-        using var cmd = new SqlCommand { Connection = db };
-        cmd.Parameters.AddWithValue("@d", pushDate.Date);
-        cmd.Parameters.AddWithValue("@n", serviceNo);
-        cmd.Parameters.AddWithValue("@u", (object?)unique ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@o", outcome);
-        cmd.Parameters.AddWithValue("@r", reply.Length > 500 ? reply[..500] : reply);
-        cmd.Parameters.AddWithValue("@ok", (object?)info.OpeningKwh ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@od", info.OpeningReadDate != null ? DateTime.Parse(info.OpeningReadDate, Inv) : DBNull.Value);
-        cmd.Parameters.AddWithValue("@md", info.MdReadDate != null ? DateTime.Parse(info.MdReadDate, Inv) : DBNull.Value);
-        cmd.Parameters.AddWithValue("@x", (object?)xml ?? DBNull.Value);
+    List<Param> DataColumns() => dataCols == null ? new List<Param>()
+        : prmList.Where(p => !p.Name.Equals("password", StringComparison.OrdinalIgnoreCase) && dataCols.Contains(p.Name)).ToList();
+
+    // Records per command: at most 4. Each monthly record is two statements with ~50 columns, so bigger commands cost SQL Server more to
+    // compile than they save in round trips (measured: 4 per command ~0.5 ms/record, 32 per command ~5 ms/record). Also kept under the
+    // parameter budget: 5 log parameters + (dataCols ? 9 fixed + one per value column : 0) per record.
+    const int MaxChunk = 4;
+    int ChunkSize() => Math.Min(MaxChunk, Math.Max(1, ParamBudget / (5 + (dataCols == null ? 0 : 9 + DataColumns().Count))));
+
+    // called one at a time from ParallelSend (and for the skipped rows); flushes a full chunk, or whatever waits after 3 seconds
+    void QueueWrite(PendingWrite w)
+    {
+        pendingWrites.Add(w);
+        if (pendingWrites.Count >= ChunkSize() || (DateTime.UtcNow - lastFlush).TotalSeconds >= 3) FlushWrites();
+    }
+
+    internal void FlushWrites()
+    {
+        var cols = DataColumns();
+        var chunk = ChunkSize();
+        while (pendingWrites.Count > 0)
+        {
+            var batch = pendingWrites.Take(chunk).ToList();
+            using var cmd = new SqlCommand { Connection = db, Transaction = Tx, CommandTimeout = 120 };
+            var sb = new System.Text.StringBuilder();
+            for (int k = 0; k < batch.Count; k++) { AppendLog(cmd, sb, k, batch[k]); if (dataCols != null) AppendData(cmd, sb, k, batch[k], cols); }
+            cmd.CommandText = sb.ToString();
+            cmd.ExecuteNonQuery();                 // if this throws the records stay queued (the final flush tries again)
+            pendingWrites.RemoveRange(0, batch.Count);
+        }
+        lastFlush = DateTime.UtcNow;
+    }
+
+    static void AppendLog(SqlCommand cmd, System.Text.StringBuilder sb, int k, PendingWrite w)
+    {
+        sb.Append($@"UPDATE dbo.PushLog_Monthly SET UniqueServiceNo=@lu{k}, Status=@ls{k}, Detail=@lt{k}, PushedOn=GETDATE() WHERE PushDate=@ld{k} AND ServiceNo=@ln{k};
+IF @@ROWCOUNT=0 INSERT dbo.PushLog_Monthly (PushDate, ServiceNo, UniqueServiceNo, Status, Detail) VALUES (@ld{k},@ln{k},@lu{k},@ls{k},@lt{k});
+");
+        // fixed types and sizes (= the column definitions) so every batch has the same shape and SQL Server reuses its plan
+        AddParam(cmd, $"@ld{k}", SqlDbType.Date, 0, w.PushDate.Date);
+        AddParam(cmd, $"@ln{k}", SqlDbType.VarChar, 50, w.ServiceNo);
+        AddParam(cmd, $"@lu{k}", SqlDbType.VarChar, 20, w.Unique);
+        AddParam(cmd, $"@ls{k}", SqlDbType.VarChar, 20, w.Status);
+        AddParam(cmd, $"@lt{k}", SqlDbType.NVarChar, 1000, w.Detail.Length > 500 ? w.Detail[..500] : w.Detail);
+    }
+
+    static void AddParam(SqlCommand cmd, string name, SqlDbType type, int size, object? value)
+    {
+        var p = type is SqlDbType.Date or SqlDbType.Decimal ? new SqlParameter(name, type) : new SqlParameter(name, type, size);
+        if (type == SqlDbType.Decimal) { p.Precision = 18; p.Scale = 2; }
+        p.Value = value ?? DBNull.Value;
+        cmd.Parameters.Add(p);
+    }
+
+    void AppendData(SqlCommand cmd, System.Text.StringBuilder sb, int k, PendingWrite w, List<Param> cols)
+    {
+        AddParam(cmd, $"@d{k}", SqlDbType.Date, 0, w.PushDate.Date);
+        AddParam(cmd, $"@n{k}", SqlDbType.VarChar, 30, w.ServiceNo);
+        AddParam(cmd, $"@u{k}", SqlDbType.VarChar, 30, w.Unique);
+        AddParam(cmd, $"@o{k}", SqlDbType.VarChar, 10, w.Status);
+        AddParam(cmd, $"@r{k}", SqlDbType.VarChar, 500, w.Detail.Length > 500 ? w.Detail[..500] : w.Detail);
+        AddParam(cmd, $"@ok{k}", SqlDbType.Decimal, 0, w.Info.OpeningKwh);
+        AddParam(cmd, $"@od{k}", SqlDbType.Date, 0, w.Info.OpeningReadDate != null ? DateTime.Parse(w.Info.OpeningReadDate, Inv) : null);
+        AddParam(cmd, $"@md{k}", SqlDbType.Date, 0, w.Info.MdReadDate != null ? DateTime.Parse(w.Info.MdReadDate, Inv) : null);
+        AddParam(cmd, $"@x{k}", SqlDbType.NVarChar, -1, w.Xml);
 
         var sets = new List<string>(); var names = new List<string>(); var vars = new List<string>();
-        for (int i = 0; i < cols.Count; i++)
+        for (int j = 0; j < cols.Count; j++)
         {
-            var p = cols[i];
-            var v = values != null && values.TryGetValue(p.Name, out var s) ? Quoted(p, s) : null;
-            cmd.Parameters.AddWithValue("@c" + i, (object?)v ?? DBNull.Value);
-            sets.Add($"[{p.Name}]=@c{i}"); names.Add($"[{p.Name}]"); vars.Add("@c" + i);
+            var p = cols[j];
+            var v = w.Values != null && w.Values.TryGetValue(p.Name, out var s) ? Quoted(p, s) : null;
+            AddParam(cmd, $"@c{k}_{j}", SqlDbType.VarChar, 100, v);
+            sets.Add($"[{p.Name}]=@c{k}_{j}"); names.Add($"[{p.Name}]"); vars.Add($"@c{k}_{j}");
         }
         var fixedCols = "UniqueServiceNo, Outcome, Reply, OpeningKwh, OpeningReadDate, MdReadDate, RequestXml";
-        cmd.CommandText = $@"
-UPDATE dbo.PushData_Monthly SET UniqueServiceNo=@u, Outcome=@o, Reply=@r, OpeningKwh=@ok, OpeningReadDate=@od, MdReadDate=@md, RequestXml=@x, PushedOn=GETDATE(){(sets.Count > 0 ? ", " + string.Join(", ", sets) : "")}
-WHERE PushDate=@d AND ServiceNo=@n;
+        sb.Append($@"UPDATE dbo.PushData_Monthly SET UniqueServiceNo=@u{k}, Outcome=@o{k}, Reply=@r{k}, OpeningKwh=@ok{k}, OpeningReadDate=@od{k}, MdReadDate=@md{k}, RequestXml=@x{k}, PushedOn=GETDATE(){(sets.Count > 0 ? ", " + string.Join(", ", sets) : "")}
+WHERE PushDate=@d{k} AND ServiceNo=@n{k};
 IF @@ROWCOUNT=0 INSERT dbo.PushData_Monthly (PushDate, ServiceNo, {fixedCols}{(names.Count > 0 ? ", " + string.Join(", ", names) : "")})
-VALUES (@d, @n, @u, @o, @r, @ok, @od, @md, @x{(vars.Count > 0 ? ", " + string.Join(", ", vars) : "")});";
-        cmd.ExecuteNonQuery();
+VALUES (@d{k}, @n{k}, @u{k}, @o{k}, @r{k}, @ok{k}, @od{k}, @md{k}, @x{k}{(vars.Count > 0 ? ", " + string.Join(", ", vars) : "")});
+");
     }
 
     // procedure column used for the opening/closing sanity checks (these readings are not part of the request)
@@ -809,19 +866,6 @@ VALUES (@d, @n, @u, @o, @r, @ok, @od, @md, @x{(vars.Count > 0 ? ", " + string.Jo
         using var r = cmd.ExecuteReader();
         while (r.Read()) set.Add(r.GetString(0).Trim());
         return set;
-    }
-
-    void WriteLog(DateTime pushDate, string serviceNo, string? unique, string status, string detail)
-    {
-        using var cmd = new SqlCommand(@"
-UPDATE dbo.PushLog_Monthly SET UniqueServiceNo=@u, Status=@s, Detail=@t, PushedOn=GETDATE() WHERE PushDate=@d AND ServiceNo=@n;
-IF @@ROWCOUNT=0 INSERT dbo.PushLog_Monthly (PushDate, ServiceNo, UniqueServiceNo, Status, Detail) VALUES (@d,@n,@u,@s,@t);", db);
-        cmd.Parameters.AddWithValue("@d", pushDate.Date);
-        cmd.Parameters.AddWithValue("@n", serviceNo);
-        cmd.Parameters.AddWithValue("@u", (object?)unique ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@s", status);
-        cmd.Parameters.AddWithValue("@t", detail.Length > 500 ? detail[..500] : detail);
-        cmd.ExecuteNonQuery();
     }
 
     static string Csv(string v) => v.Contains(',') || v.Contains('"') ? "\"" + v.Replace("\"", "\"\"") + "\"" : v;
