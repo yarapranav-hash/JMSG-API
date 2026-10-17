@@ -15,6 +15,7 @@ class HourlyScheduler : BackgroundService
 
     readonly string connStr;
     DateTime lastSlot = DateTime.MinValue;   // the hour already handled (started, or recorded as missed)
+    Job? lastJob;                            // the run started for lastSlot
     DateTime busySlot = DateTime.MinValue; int busyTries;
     bool warnedTables;
 
@@ -50,7 +51,16 @@ class HourlyScheduler : BackgroundService
         }
 
         if (now.Minute < Minute) return;
-        if (lastSlot == slot) return;
+        if (lastSlot == slot)
+        {
+            // the run for this hour has ended without doing anything (it failed while loading): try again a minute later, until HH:59
+            if (lastJob is { Finished: { } fin } && now - fin > TimeSpan.FromSeconds(60) && !RunStore.HasRun(connStr, slot.Date, slot.Hour))
+            {
+                Console.WriteLine($"[scheduler] {now:HH:mm:ss} the run for {slot:yyyy-MM-dd HH}:00 did not complete - trying again");
+                lastSlot = DateTime.MinValue; lastJob = null;
+            }
+            else return;
+        }
         if (RunStore.HasRun(connStr, slot.Date, slot.Hour)) { lastSlot = slot; return; }
         if (now.Minute >= WindowEnd) { lastSlot = slot; return; }
 
@@ -61,7 +71,7 @@ class HourlyScheduler : BackgroundService
             if (busyTries++ == 0) Console.WriteLine($"[scheduler] {now:HH:mm:ss} reading hour {slot:HH}:00 waiting: {error}");
             return; // try again at the next tick
         }
-        lastSlot = slot;
+        lastSlot = slot; lastJob = job;
         Console.WriteLine($"[scheduler] {now:HH:mm:ss} started the run for the {slot:yyyy-MM-dd HH}:00 readings (job {job.Id})");
     }
 }
@@ -101,12 +111,23 @@ static class RunStore
         return Convert.ToInt32(cmd.ExecuteScalar()) == 1;
     }
 
+    public const int MaxAttempts = 3;   // a run that failed before it sent anything is tried again, up to this many runs for one hour
+
+    // The hour has been handled: a run exists that did something (sent, nothing to send, stopped, missed ...). A run that FAILED before
+    // it had anything to send (the database timed out while loading) does not count - the scheduler tries that hour again, up to MaxAttempts times.
     public static bool HasRun(string connStr, DateTime date, int hour)
     {
         using var db = new SqlConnection(connStr); db.Open();
-        using var cmd = new SqlCommand("SELECT COUNT(*) FROM dbo.PushRun_Hourly WHERE ReadingDate=@d AND ReadingHour=@h", db);
+        using var cmd = new SqlCommand(@"SELECT
+  SUM(CASE WHEN State='Failed' AND Planned=0 AND Accepted=0 AND Failed=0 THEN 0 ELSE 1 END),
+  COUNT(*)
+FROM dbo.PushRun_Hourly WHERE ReadingDate=@d AND ReadingHour=@h", db) { CommandTimeout = 120 };
         cmd.Parameters.AddWithValue("@d", date.Date); cmd.Parameters.AddWithValue("@h", (byte)hour);
-        return Convert.ToInt32(cmd.ExecuteScalar()) > 0;
+        using var r = cmd.ExecuteReader();
+        r.Read();
+        var counted = r.IsDBNull(0) ? 0 : r.GetInt32(0);
+        var all = r.GetInt32(1);
+        return counted > 0 || all >= MaxAttempts;
     }
 
     public static int Start(string connStr, DateTime date, int hour)
@@ -137,6 +158,45 @@ Replies=@r, Message=@m, FinishedOn=CASE WHEN @fin=1 THEN GETDATE() ELSE Finished
         cmd.Parameters.AddWithValue("@r", (object?)Cut(replies) ?? DBNull.Value); cmd.Parameters.AddWithValue("@m", (object?)Cut(message) ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@fin", finished ? 1 : 0);
         cmd.ExecuteNonQuery();
+    }
+
+    // After a manual send of an hour: the Automatic tab shows the LATEST numbers for that hour. The counts and the API replies are
+    // recalculated from the hour's records in dbo.PushLog_Hourly (a meter sent again replaces its earlier record, so a failed meter that
+    // is now accepted counts as accepted). The latest run row of the hour is updated; if the hour has no run row (the scheduler did not run
+    // for it) one is added.
+    public static void SyncAfterManualSend(string connStr, DateTime date, int hour, int skipped, DateTime jobStarted, string? stoppedBecause)
+    {
+        using var db = new SqlConnection(connStr); db.Open();
+        int ok = 0, failed = 0;
+        using (var c = new SqlCommand("SELECT Status, COUNT(*) FROM dbo.PushLog_Hourly WHERE ReadingDate=@d AND ReadingHour=@h GROUP BY Status", db) { CommandTimeout = 120 })
+        {
+            c.Parameters.AddWithValue("@d", date.Date); c.Parameters.AddWithValue("@h", (byte)hour);
+            using var r = c.ExecuteReader();
+            while (r.Read()) { if (r.GetString(0) == "OK") ok = r.GetInt32(1); else if (r.GetString(0) == "FAILED") failed = r.GetInt32(1); }
+        }
+        var replies = new List<string>();
+        using (var c = new SqlCommand("SELECT TOP 6 Detail, COUNT(*) FROM dbo.PushLog_Hourly WHERE ReadingDate=@d AND ReadingHour=@h GROUP BY Detail ORDER BY COUNT(*) DESC", db) { CommandTimeout = 120 })
+        {
+            c.Parameters.AddWithValue("@d", date.Date); c.Parameters.AddWithValue("@h", (byte)hour);
+            using var r = c.ExecuteReader();
+            while (r.Read()) replies.Add($"{(r.IsDBNull(0) ? "" : r.GetString(0))}: {r.GetInt32(1)}");
+        }
+        int? runId = null;
+        using (var c = new SqlCommand("SELECT TOP 1 RunId FROM dbo.PushRun_Hourly WHERE ReadingDate=@d AND ReadingHour=@h ORDER BY RunId DESC", db) { CommandTimeout = 120 })
+        {
+            c.Parameters.AddWithValue("@d", date.Date); c.Parameters.AddWithValue("@h", (byte)hour);
+            if (c.ExecuteScalar() is int id) runId = id;
+        }
+        var state = failed == 0 && stoppedBecause == null ? "Passed" : ok == 0 ? "Failed" : "Partial";
+        var note = $"updated after a manual send at {DateTime.Now:HH:mm}: {ok} accepted, {failed} failed" + (stoppedBecause != null ? $"; stopped: {stoppedBecause}" : "");
+        if (runId == null)
+        {
+            runId = Start(connStr, date, hour);
+            using var u = new SqlCommand("UPDATE dbo.PushRun_Hourly SET StartedOn=@s WHERE RunId=@id", db);
+            u.Parameters.AddWithValue("@s", jobStarted); u.Parameters.AddWithValue("@id", runId.Value);
+            u.ExecuteNonQuery();
+        }
+        Update(connStr, runId.Value, state, ok + failed, 0, skipped, ok, failed, string.Join("; ", replies), note, true);
     }
 
     // different meters with a FAILED record on this reading date (any hour)

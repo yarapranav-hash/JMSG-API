@@ -25,6 +25,29 @@ class HourlyPush
         logSink = log ?? (m => Console.WriteLine($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {m}"));
     }
 
+    // Why a record was rejected, in plain words. `value` gives a request value by its field name (reading_kvah, rmd_kw ...).
+    // ORA-01438 = a number does not fit the vendor's database column: the values that look impossible are named.
+    public static string FailReason(string? reply, Func<string, string?> value)
+    {
+        var r = reply ?? "";
+        if (r.Contains("ORA-01438", StringComparison.OrdinalIgnoreCase))
+        {
+            double? Num(string name) => double.TryParse(value(name), NumberStyles.Float, CultureInfo.InvariantCulture, out var d) ? d : null;
+            var odd = new List<string>();
+            void Add(string name) => odd.Add($"{name} {Num(name)!.Value.ToString("#,0.###", CultureInfo.InvariantCulture)}");
+            // measured on 4,000+ accepted and 160 failed records of one day: every failed record had a value of 10,000,000 or more here,
+            // the largest accepted value was 9,889,300.06 - so the vendor columns hold less than 10 million
+            foreach (var n in new[] { "rmd_kw", "rmd_kva", "reading_kvah", "reading_kwh" }) if (Num(n) is >= 10_000_000) Add(n);
+            return odd.Count > 0
+                ? "The meter reported a value of 10 million or more: " + string.Join(", ", odd) + ". The vendor database cannot store a number this large (ORA-01438). The reading in the meter table is wrong, not the program."
+                : "The vendor database says a value is too large for its column (ORA-01438), but no value in this request looks unusual - check the request values.";
+        }
+        if (r.Contains("already updated", StringComparison.OrdinalIgnoreCase)) return "";
+        if (r.Contains("un-successful:null", StringComparison.OrdinalIgnoreCase)) return "The vendor rejected the record without giving a reason.";
+        if (r.StartsWith("HTTP", StringComparison.OrdinalIgnoreCase)) return "The vendor server returned an error or did not answer - not a data problem; it is retried in the next run.";
+        return r.Length > 0 ? "The vendor rejected the record: " + r : "";
+    }
+
     // ------------------------------------------------------------ field rules, in the order of the request
     // "proc:<column>" = value from the procedure row, "svc:*" = from ServiceDetails, "date"/"time" = reading date / hour, anything else = fixed value
     internal static readonly (string Name, string Source)[] Fields =
@@ -180,9 +203,16 @@ WHERE RK=1", conn) { CommandTimeout = 300 };
         var missing = Needed.Where(n => string.IsNullOrWhiteSpace(values[n])).ToList();
         if (missing.Count > 0) { Skip(svc.Unique, "no value in the reading for " + string.Join(", ", missing)); return; }
 
+        // junk meter readings are not sent: MD kW / MD kVA above the limit (default 7; PushConfig GLOBAL HOURLY_MAX_MD changes it)
+        foreach (var n in new[] { "rmd_kw", "rmd_kva" })
+            if (double.TryParse(values[n], NumberStyles.Float, Inv, out var md) && md > MaxMd)
+            { Skip(svc.Unique, $"{n} {md.ToString("#,0.###", Inv)} is above the limit of {MaxMd.ToString(Inv)}"); return; }
+
         var xml = Soap.Envelope(Op, Fields.Select(f => (f.Name, values[f.Name])));
         items.Add(new HItem(no, svc.Unique!, values, xml, done.Contains(no), stamp!.Trim()));
     }
+
+    double MaxMd => double.TryParse(global.GetValueOrDefault("HOURLY_MAX_MD", "7"), NumberStyles.Float, Inv, out var v) && v > 0 ? v : 7;
 
     // ------------------------------------------------------------ quick test (a test limit is set)
     // Only candidate meters are read, straight from their own modem table, with the same selection rule the procedure uses
@@ -304,14 +334,14 @@ WHERE RK=1", conn) { CommandTimeout = 300 };
 
     bool LogTableExists()
     {
-        using var cmd = new SqlCommand("SELECT OBJECT_ID('dbo.PushLog_Hourly')", db);
+        using var cmd = new SqlCommand("SELECT OBJECT_ID('dbo.PushLog_Hourly')", db) { CommandTimeout = 120 };
         return cmd.ExecuteScalar() is not (null or DBNull);
     }
 
     Dictionary<string, MonthlyPush.Svc> LoadServices()
     {
         var d = new Dictionary<string, MonthlyPush.Svc>(StringComparer.Ordinal);
-        using var cmd = new SqlCommand("SELECT ServiceNo, UniqueServiceNo, ContractedLoad FROM dbo.ServiceDetails WHERE IsActive=1", db);
+        using var cmd = new SqlCommand("SELECT ServiceNo, UniqueServiceNo, ContractedLoad FROM dbo.ServiceDetails WHERE IsActive=1", db) { CommandTimeout = 120 };
         using var r = cmd.ExecuteReader();
         while (r.Read())
         {
@@ -327,7 +357,7 @@ WHERE RK=1", conn) { CommandTimeout = 300 };
     HashSet<string> LoadDone(DateTime date, int hour)
     {
         var set = new HashSet<string>(StringComparer.Ordinal);
-        using var cmd = new SqlCommand("SELECT ServiceNo FROM dbo.PushLog_Hourly WHERE ReadingDate=@d AND ReadingHour=@h AND Status='OK'", db);
+        using var cmd = new SqlCommand("SELECT ServiceNo FROM dbo.PushLog_Hourly WHERE ReadingDate=@d AND ReadingHour=@h AND Status='OK'", db) { CommandTimeout = 120 };
         cmd.Parameters.AddWithValue("@d", date.Date);
         cmd.Parameters.AddWithValue("@h", (byte)hour);
         using var r = cmd.ExecuteReader();

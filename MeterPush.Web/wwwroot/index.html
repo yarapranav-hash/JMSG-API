@@ -510,8 +510,8 @@ function showHResult(j) {
     `<div class="msg ${bad ? 'warn' : 'ok'}">${j.stoppedBecause ? 'Stopped: ' + esc(j.stoppedBecause) + '. ' : ''}Accepted <b>${j.pushed}</b>, failed <b>${j.failed}</b>, of ${j.total} planned. Run Preview again to see what is left; failed meters are retried automatically.</div>` +
     (j.replies.length ? '<div class="scroll"><table><tr><th>API reply</th><th>Meaning</th><th>Meters</th></tr>' + j.replies.map(r => `<tr><td>${esc(r.reply)}</td><td>${esc(r.meaning)}</td><td>${r.count}</td></tr>`).join('') + '</table></div>' : '') +
     (j.failures && j.failures.length
-      ? '<h3 style="margin:16px 0 6px;font-size:15px">Why meters failed</h3><div class="scroll"><table><tr><th>Service no</th><th>Unique no</th><th>API reply</th><th>What it usually means</th></tr>' +
-        j.failures.map(f => `<tr><td>${esc(f.serviceNo)}</td><td>${esc(f.ukscno)}</td><td>${esc(f.reply)}</td><td class="wrap">${esc(failHint(f))}</td></tr>`).join('') + '</table></div>' : '') +
+      ? '<h3 style="margin:16px 0 6px;font-size:15px">Why meters failed</h3><div class="scroll"><table><tr><th>Service no</th><th>Unique no</th><th>Failed because</th><th>API reply</th></tr>' +
+        j.failures.map(f => `<tr><td>${esc(f.serviceNo)}</td><td>${esc(f.ukscno)}</td><td class="wrap">${esc(f.reason || failHint(f))}</td><td class="wrap muted">${esc(f.reply)}</td></tr>`).join('') + '</table></div>' : '') +
     '<p style="margin:12px 0 4px"><button class="primary" id="hrDlSent">Download Excel of what was sent (with Date &amp; Time from the table)</button> ' +
     (j.failed > 0 ? '<button class="danger" id="hrDlFail">Download Excel of the failed meters</button>' : '') + '</p>' +
     '<p class="small muted">Every record and the reply is saved - see Hourly history below (click a row to see the full request).</p>';
@@ -552,12 +552,12 @@ async function loadHHistory() {
   const d = await api(`/hourly/history?date=${date}&hour=${hour}&status=${$('hhStatus').value}&q=${encodeURIComponent($('hhSearch').value)}&take=300`);
   const c = d.counts;
   $('hhStats').innerHTML = `<div class="stat ok"><b>${c.OK || 0}</b><span>sent (OK)</span></div><div class="stat bad"><b>${c.FAILED || 0}</b><span>failed</span></div>`;
-  $('hhTable').innerHTML = '<tr><th>Service no</th><th>Unique no</th><th>Meter</th><th>Reading at</th><th>Outcome</th><th>Meaning</th><th>API reply</th><th>When</th></tr>' +
-    d.rows.map((r, i) => `<tr class="click" data-i="${i}"><td>${esc(r.serviceNo)}</td><td>${esc(r.unique)}</td><td>${esc(r.meterNo)}</td><td>${esc(r.readAt)}</td><td><span class="pill ${r.status}">${esc(r.status)}</span></td><td>${esc(r.meaning)}</td><td class="wrap muted">${esc(r.reply)}</td><td>${esc((r.pushedOn || '').replace('T', ' ').slice(0, 19))}</td></tr>`).join('');
+  $('hhTable').innerHTML = '<tr><th>Service no</th><th>Unique no</th><th>Meter</th><th>Reading at</th><th>Outcome</th><th>Meaning</th><th>Failed because</th><th>API reply</th><th>When</th></tr>' +
+    d.rows.map((r, i) => `<tr class="click" data-i="${i}"><td>${esc(r.serviceNo)}</td><td>${esc(r.unique)}</td><td>${esc(r.meterNo)}</td><td>${esc(r.readAt)}</td><td><span class="pill ${r.status}">${esc(r.status)}</span></td><td>${esc(r.meaning)}</td><td class="wrap">${esc(r.reason)}</td><td class="wrap muted">${esc(r.reply)}</td><td>${esc((r.pushedOn || '').replace('T', ' ').slice(0, 19))}</td></tr>`).join('');
   $('hhTable').querySelectorAll('tr.click').forEach(tr => tr.onclick = async () => {
     const r = d.rows[+tr.dataset.i];
     $('detailTitle').textContent = 'Service ' + r.serviceNo + ' - ' + date + ' ' + String(hour).padStart(2, '0') + ':00';
-    const head = `<p class="small"><span class="pill ${esc(r.status)}">${esc(r.status)}</span> &nbsp; ${esc(r.reply)}</p>`;
+    const head = `<p class="small"><span class="pill ${esc(r.status)}">${esc(r.status)}</span> &nbsp; ${esc(r.reply)}</p>` + (r.reason ? `<p class="small"><b>Failed because:</b> ${esc(r.reason)}</p>` : '');
     $('detailBody').innerHTML = head + '<p class="muted small">Loading the request...</p>';
     $('detailModal').classList.remove('hidden');
     try {
@@ -631,7 +631,7 @@ $('scToggle').onclick = async () => {
 async function showRun(r) {
   $('detailTitle').textContent = `Automatic run for ${r.date} ${hhmm(r.hour)}`;
   let html = `<p class="small">${runPill(r.state)} &nbsp; <span class="muted">started ${esc((r.started || '').replace('T', ' ').slice(0, 19))}${r.finished ? ', finished ' + esc(timeOf(r.finished)) : ''}</span></p>` +
-    kv([['Meters to send', r.planned], ['Accepted by the API', r.accepted], ['Failed', r.failed], ['Already sent before', r.alreadySent], ['Skipped (not at this hour, missing values ...)', r.skipped], ['API replies', r.replies || ''], ['Notes', r.message || '']]);
+    kv([['Meters to send', r.planned], ['Accepted by the API', r.accepted], ['Failed', r.failed], ['Already sent before', r.alreadySent], ['Skipped (missing values, MD above the limit ...)', r.skipped], ['API replies', r.replies || ''], ['Notes', r.message || '']]);
   // Only the counts are kept for succeeded meters. Nothing is read for the run until its row is clicked; then only the FAILED meters
   // are loaded (a handful), and the Excel (failed meters only) is built when its button is pressed.
   html += '<div id="rdList">' + (r.failed > 0 ? '<p class="muted small">Loading the failed meters...</p>' : '<p class="muted small">No failed meters in this run.</p>') + '</div>' +
@@ -644,8 +644,8 @@ async function showRun(r) {
       const d = await api(`/hourly/history?date=${r.date}&hour=${r.hour}&status=FAILED&take=300`);
       const total = d.counts.FAILED || 0;
       $('rdList').innerHTML = `<h3 style="margin:14px 0 6px;font-size:15px">Meters that failed (${total})</h3>` +
-        `<div class="scroll" style="max-height:260px"><table><tr><th>Service no</th><th>Unique no</th><th>Meter</th><th>Date &amp; Time</th><th>API reply</th></tr>` +
-        d.rows.map(x => `<tr><td>${esc(x.serviceNo)}</td><td>${esc(x.unique)}</td><td>${esc(x.meterNo)}</td><td>${esc(x.readAt)}</td><td class="wrap">${esc(x.reply)}</td></tr>`).join('') + '</table></div>' +
+        `<div class="scroll" style="max-height:260px"><table><tr><th>Service no</th><th>Unique no</th><th>Meter</th><th>Date &amp; Time</th><th>Failed because</th><th>API reply</th></tr>` +
+        d.rows.map(x => `<tr><td>${esc(x.serviceNo)}</td><td>${esc(x.unique)}</td><td>${esc(x.meterNo)}</td><td>${esc(x.readAt)}</td><td class="wrap">${esc(x.reason)}</td><td class="wrap muted">${esc(x.reply)}</td></tr>`).join('') + '</table></div>' +
         (total > d.rows.length ? `<p class="muted small">Showing the first ${d.rows.length} of ${total}. The Excel download has all of them.</p>` : '');
     } catch (e) { $('rdList').innerHTML = `<p class="muted small">Could not load the failed meters: ${esc(e.message)}</p>`; }
   }

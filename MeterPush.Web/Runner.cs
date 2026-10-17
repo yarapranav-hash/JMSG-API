@@ -31,7 +31,7 @@ class Job
 }
 
 // Empty = request fields that had no value (their element was left out), a likely reason for "Un-Successful:null"
-record FailRow(string ServiceNo, string Unique, string Reply, List<string> Empty);
+record FailRow(string ServiceNo, string Unique, string Reply, List<string> Empty, string? Reason = null);
 
 class StoredPlan
 {
@@ -94,7 +94,7 @@ static class Runner
         var db = new SqlConnection(connStr);
         db.Open();
         var g = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        using var cmd = new SqlCommand("SELECT ParamName, SourceValue FROM dbo.PushConfig WHERE Operation='GLOBAL' AND IsActive=1", db);
+        using var cmd = new SqlCommand("SELECT ParamName, SourceValue FROM dbo.PushConfig WHERE Operation='GLOBAL' AND IsActive=1", db) { CommandTimeout = 120 };
         using var r = cmd.ExecuteReader();
         while (r.Read()) g[r.GetString(0)] = r.IsDBNull(1) ? "" : r.GetString(1);
         return (db, g);
@@ -198,10 +198,24 @@ static class Runner
             {
                 job.Log($"Scheduler: automatic hourly run for {date:yyyy-MM-dd} {hour:00}:00");
                 runId = RunStore.Start(connStr, date, hour);
-                var (db, global) = Open(connStr);
-                using var dbScope = db;
-                using var http = new HttpClient();
-                var plan = new HourlyPush(db, connStr, http, global, job.Log).Plan(date, hour, 0, false);
+                // the lists are loaded from a busy database (midnight jobs can hold it for a while): on an error try again, 3 times
+                HourlyPush.HPlan plan;
+                for (var attempt = 1; ; attempt++)
+                {
+                    try
+                    {
+                        var (db, global) = Open(connStr);
+                        using var dbScope = db;
+                        using var http = new HttpClient();
+                        plan = new HourlyPush(db, connStr, http, global, job.Log).Plan(date, hour, 0, false);
+                        break;
+                    }
+                    catch (Exception ex) when (attempt < 3)
+                    {
+                        job.Log($"Scheduler: loading the meters failed ({ex.Message}) - trying again in 20 s (attempt {attempt} of 3)");
+                        Thread.Sleep(20000);
+                    }
+                }
                 var sp = new StoredHourlyPlan { Plan = plan, Sent = true }; // not kept in HPlans: the Automatic tab reads the results from the database
                 job.Total = plan.ToSend.Count;
                 var already = plan.Items.Count(i => i.Done);
@@ -241,12 +255,20 @@ static class Runner
             job.Index = p.Index; job.Pushed = p.Pushed; job.Failed = p.Failed;
             if (p.Ok) return;
             var it = sp.Plan.ToSend.FirstOrDefault(i => i.ServiceNo == p.ServiceNo);
-            lock (job.Failures) job.Failures.Add(new FailRow(p.ServiceNo, it?.Unique ?? "", p.Reply, new List<string>()));
+            var reason = HourlyPush.FailReason(p.Reply, n => it?.Values.GetValueOrDefault(n));
+            lock (job.Failures) job.Failures.Add(new FailRow(p.ServiceNo, it?.Unique ?? "", p.Reply, new List<string>(), reason));
         }, job.Cts.Token);
         job.Pushed = res.Pushed; job.Failed = res.Failed;
         job.Replies = res.Replies;
         job.StoppedBecause = res.StoppedBecause;
         job.State = res.StoppedBecause != null ? "Stopped" : "Done";
+
+        // a manual send of an hour also updates that hour in the Automatic tab (the scheduler's own run writes its row itself)
+        if (!job.Scheduled && RunStore.Ready(connStr))
+        {
+            try { RunStore.SyncAfterManualSend(connStr, sp.Plan.Date, sp.Plan.Hour, sp.Plan.Skips.Count, job.Started, res.StoppedBecause); }
+            catch (Exception ex) { job.Log("Could not update the Automatic tab for this hour: " + ex.Message); }
+        }
     }
 
     static void DoSend(Job job, string connStr, StoredPlan sp)

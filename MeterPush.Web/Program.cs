@@ -98,7 +98,7 @@ api.MapGet("/jobs/{id}", (string id, int? from, int? lines) =>
         id = j.Id, op = j.Op, kind = j.Kind, state = j.State, pushDate = j.PushDate, started = j.Started, finished = j.Finished,
         planId = j.PlanId, error = j.Error, total = j.Total, index = j.Index, pushed = j.Pushed, failed = j.Failed,
         replies = j.Replies.OrderByDescending(r => r.Value).Select(r => new { reply = r.Key, count = r.Value, meaning = ReplyMeaning(r.Key) }),
-        failures = FailuresOf(j).Select(f => new { serviceNo = f.ServiceNo, ukscno = f.Unique, reply = f.Reply, meaning = ReplyMeaning(f.Reply), emptyFields = f.Empty }),
+        failures = FailuresOf(j).Select(f => new { serviceNo = f.ServiceNo, ukscno = f.Unique, reply = f.Reply, meaning = ReplyMeaning(f.Reply), reason = f.Reason, emptyFields = f.Empty }),
         stoppedBecause = j.StoppedBecause, lines = lines_, nextLine = start + lines_.Length
     });
 });
@@ -371,7 +371,7 @@ api.MapGet("/hourly/history", (string date, int hour, string? status, string? q,
         while (r.Read()) counts[r.GetString(0)] = r.GetInt32(1);
     }
     using (var c = new SqlCommand(@"
-SELECT TOP (@take) ServiceNo, UniqueServiceNo, MeterNo, ReadAt, Status, Detail, PushedOn
+SELECT TOP (@take) ServiceNo, UniqueServiceNo, MeterNo, ReadAt, Status, Detail, PushedOn, CASE WHEN Status='FAILED' THEN RequestXml END
 FROM dbo.PushLog_Hourly
 WHERE ReadingDate=@d AND ReadingHour=@h
   AND (@status IS NULL OR Status=@status)
@@ -391,6 +391,7 @@ ORDER BY PushedOn DESC, ServiceNo", db))
             {
                 serviceNo = r.GetString(0), unique = r.IsDBNull(1) ? null : r.GetString(1), meterNo = r.IsDBNull(2) ? null : r.GetString(2),
                 readAt = r.IsDBNull(3) ? null : r.GetString(3), status = r.GetString(4), reply = detail, meaning = ReplyMeaning(detail),
+                reason = r.GetString(4) == "FAILED" ? HourlyReason(detail, r.IsDBNull(7) ? null : r.GetString(7)) : "",
                 pushedOn = r.GetDateTime(6)
             });
         }
@@ -462,7 +463,7 @@ api.MapGet("/hourly/history/download", (string date, int hour, string? status, s
     using var db = new SqlConnection(connStr); db.Open();
     var rows = new List<string[]>
     {
-        new[] { "service_no", "unique_service_no", "meter_no", "Date & Time (from the table)", "outcome", "api_reply", "sent_on" }
+        new[] { "service_no", "unique_service_no", "meter_no", "Date & Time (from the table)", "outcome", "api_reply", "reason", "sent_on" }
             .Concat(HourlyPush.Fields.Select(f => f.Name)).ToArray()
     };
     using var c = new SqlCommand(@"
@@ -486,7 +487,8 @@ ORDER BY ReadAt, ServiceNo", db);
                 catch (System.Xml.XmlException) { }
             }
             string S(int i) => r.IsDBNull(i) ? "" : Convert.ToString(r.GetValue(i), System.Globalization.CultureInfo.InvariantCulture) ?? "";
-            rows.Add(new[] { S(0), S(1), S(2), S(3), S(4), S(5), r.GetDateTime(6).ToString("yyyy-MM-dd HH:mm:ss") }
+            var why = S(4) == "FAILED" ? HourlyPush.FailReason(S(5), n => sent.GetValueOrDefault(n)) : "";
+            rows.Add(new[] { S(0), S(1), S(2), S(3), S(4), S(5), why, r.GetDateTime(6).ToString("yyyy-MM-dd HH:mm:ss") }
                 .Concat(HourlyPush.Fields.Select(f => sent.GetValueOrDefault(f.Name) ?? "")).ToArray());
         }
     var book = XlsxWriter.Build(new[] { ("Sent", rows) });
@@ -624,10 +626,23 @@ static string HourlySkipLabel(string why)
     if (w.StartsWith("latest reading is at")) return "Latest reading is not at the chosen hour";
     if (w.StartsWith("no reading at") || w.StartsWith("no reading for")) return "No reading at this hour";
     if (w.StartsWith("no value in the reading")) return "Value missing in the reading";
+    if (w.StartsWith("rmd_")) return "MD value above the limit (junk reading)";
     if (w.StartsWith("no date & time")) return "No Date & Time in the reading";
     if (w.StartsWith("no valid 9-digit")) return "No valid unique service number";
     if (w.StartsWith("service not found")) return "Service not in ServiceDetails";
     return "Other";
+}
+
+// reason a stored hourly record failed, worked out from the reply and the request XML saved with it
+static string HourlyReason(string reply, string? xml)
+{
+    var sent = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    if (!string.IsNullOrEmpty(xml))
+    {
+        try { foreach (var e in System.Xml.Linq.XDocument.Parse(xml).Descendants().Where(e => !e.HasElements)) sent[e.Name.LocalName] = e.Value; }
+        catch (System.Xml.XmlException) { }
+    }
+    return HourlyPush.FailReason(reply, n => sent.GetValueOrDefault(n));
 }
 
 static FailRow[] FailuresOf(Job j) { lock (j.Failures) return j.Failures.ToArray(); }
