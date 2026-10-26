@@ -448,11 +448,13 @@ api.MapGet("/hourly/runs", (string? date, int? take) =>
     var rows = RunStore.List(connStr, take ?? 72, only).Select(r => new
     {
         runId = r.RunId, date = r.ReadingDate.ToString("yyyy-MM-dd"), hour = r.ReadingHour, started = r.StartedOn, finished = r.FinishedOn, state = r.State,
-        planned = r.Planned, alreadySent = r.AlreadySent, skipped = r.Skipped, accepted = r.Accepted, failed = r.Failed, replies = r.Replies, message = r.Message
+        planned = r.Planned, alreadySent = r.AlreadySent, skipped = r.Skipped, accepted = r.Accepted, failed = r.Failed, replies = r.Replies, message = r.Message,
+        sizeKb = r.SentBytes.HasValue ? Math.Round(r.SentBytes.Value / 1024.0, 1) : (double?)null
     });
     // for the date's summary box: how many DIFFERENT meters failed on that date (the same meter failing every hour counts once)
     var distinctFailed = only.HasValue ? RunStore.DistinctFailed(connStr, only.Value) : (int?)null;
-    return Results.Ok(new { ready = true, rows, distinctFailed });
+    var distinctSent = only.HasValue ? RunStore.DistinctSent(connStr, only.Value) : (int?)null;   // different meters accepted on that date
+    return Results.Ok(new { ready = true, rows, distinctFailed, distinctSent });
 });
 
 // Excel of what was sent for one date and hour: the meter's "Date & Time" from the table, the API reply and every value of the request
@@ -623,8 +625,8 @@ static string? HV(HourlyPush.HItem i, string name) => i.Values.TryGetValue(name,
 static string HourlySkipLabel(string why)
 {
     var w = why.ToLowerInvariant();
-    if (w.StartsWith("latest reading is at")) return "Latest reading is not at the chosen hour";
-    if (w.StartsWith("no reading at") || w.StartsWith("no reading for")) return "No reading at this hour";
+    if (w.StartsWith("latest reading is at")) return "Latest reading is outside the chosen hour";
+    if (w.StartsWith("no reading at") || w.StartsWith("no reading for")) return "No reading in this hour";
     if (w.StartsWith("no value in the reading")) return "Value missing in the reading";
     if (w.StartsWith("rmd_")) return "MD value above the limit (junk reading)";
     if (w.StartsWith("no date & time")) return "No Date & Time in the reading";

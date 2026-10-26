@@ -438,7 +438,9 @@ GROUP BY SD.ServiceNo, MDM.ModemIMEIno", db) { CommandTimeout = 300 };
     }
 
     // One service, one day: the same row the procedure returns for it (same column names), or null if it has none.
-    internal static Reading? ReadQuick(SqlConnection conn, List<string> tables, string serviceNo, DateTime date, string timeFrom = "00:00:00", string timeTo = "23:59:59")
+    // `window` (hourly): the reading time must be after window.From and up to window.To, and the latest reading time wins (instead of the newest CRTS)
+    internal static Reading? ReadQuick(SqlConnection conn, List<string> tables, string serviceNo, DateTime date, string timeFrom = "00:00:00", string timeTo = "23:59:59",
+        (DateTime From, DateTime To)? window = null)
     {
         var day = date.ToString("yyyy-MM-dd", Inv);
         var rows = new List<Reading>();
@@ -453,18 +455,18 @@ FROM (SELECT DD.DCSNo AS [DC SNo], SD.ServiceNo AS [Service No], MD.MeterSNo AS 
              DT.CumulativeEnergykWh AS [Meter Reading(kWh)], DT.CumulativeEnergykVAh AS [Meter Reading(kVAh)],
              DT.MDkW AS [MD kW], DT.MDkWTS AS [MD kW TS], DT.MDkVA AS [MD kVA], DT.MDkVATS AS [MD kVA TS], STD.STATUSDESCRIPTION AS [Event Status],
              CONVERT(VARCHAR(16), DT.REALTIMECLOCKDATEANDTIME, 121) AS [Date & Time],
-             RANK() OVER (PARTITION BY SD.ServiceNo ORDER BY DT.CRTS DESC) AS RK
+             RANK() OVER (PARTITION BY SD.ServiceNo ORDER BY {(window == null ? "DT.CRTS DESC" : "DT.REALTIMECLOCKDATEANDTIME DESC, DT.CRTS DESC")}) AS RK
       FROM {Br(t)} AS DT
       LEFT OUTER JOIN ServiceDetails SD ON SD.ServiceConnId=DT.ServiceconnId
       LEFT OUTER JOIN DCDetails DD ON SD.DCId=DD.DCId
       LEFT OUTER JOIN MeterDetails MD ON MD.MeterId=DT.MeterId
       LEFT OUTER JOIN STATUSDETAILS STD ON STD.STATUSCODE=MD.STATUSCODE
-      WHERE DT.REALTIMECLOCKDATEANDTIME BETWEEN @from AND @to
+      WHERE {(window == null ? "DT.REALTIMECLOCKDATEANDTIME BETWEEN @from AND @to" : "DT.REALTIMECLOCKDATEANDTIME > @from AND DT.REALTIMECLOCKDATEANDTIME <= @to")}
         AND SD.IsActive=1 AND DT.NORMALPHASECURRENT IS NOT NULL AND DT.MDKW IS NOT NULL AND SD.FEEDERID IN (6,11,19)
         AND SD.ServiceNo=@sn) A
 WHERE RK=1", conn) { CommandTimeout = 300 };
-            cmd.Parameters.Add("@from", SqlDbType.VarChar, 30).Value = day + " " + timeFrom;
-            cmd.Parameters.Add("@to", SqlDbType.VarChar, 30).Value = day + " " + timeTo;
+            cmd.Parameters.Add("@from", SqlDbType.VarChar, 30).Value = window is { } w ? w.From.ToString("yyyy-MM-dd HH:mm:ss", Inv) : day + " " + timeFrom;
+            cmd.Parameters.Add("@to", SqlDbType.VarChar, 30).Value = window is { } w2 ? w2.To.ToString("yyyy-MM-dd HH:mm:ss", Inv) : day + " " + timeTo;
             cmd.Parameters.Add("@sn", SqlDbType.VarChar, 50).Value = serviceNo;
             using var r = cmd.ExecuteReader();
             while (r.Read())

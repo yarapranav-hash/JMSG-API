@@ -1,8 +1,8 @@
 using Microsoft.Data.SqlClient;
 
 // Automatic hourly push: at the start of every hour (20:00, 21:00 ...) the web app pushes the readings of the PREVIOUS hour
-// (19:00, 20:00 ...; at 00:00 it is 23:00 of the day before), exactly like Automatic mode on the Hourly tab: every meter's reading stamped
-// exactly that hour is sent whatever later readings it has, meters already sent for that hour are not sent again.
+// (19:00, 20:00 ...; at 00:00 it is 23:00 of the day before), exactly like Automatic mode on the Hourly tab: every meter's latest reading
+// in the hour up to that hour (for 19:00: after 18:00:00 up to 19:00:00) is sent whatever later readings it has, meters already sent for that hour are not sent again.
 // Switched on/off from the "Hourly: Automatic" tab; the switch is stored in dbo.PushConfig (GLOBAL / HOURLY_SCHEDULER = ON | OFF, default OFF).
 // Every run is summarised in dbo.PushRun_Hourly (sql\06_create_PushRun_Hourly.sql), the meters in dbo.PushLog_Hourly.
 class HourlyScheduler : BackgroundService
@@ -98,7 +98,7 @@ VALUES ('GLOBAL','HOURLY_SCHEDULER','SETTING',@v,50,N'ON = the web page sends th
 }
 
 record RunRow(int RunId, DateTime ReadingDate, int ReadingHour, DateTime StartedOn, DateTime? FinishedOn, string State,
-    int Planned, int AlreadySent, int Skipped, int Accepted, int Failed, string? Replies, string? Message);
+    int Planned, int AlreadySent, int Skipped, int Accepted, int Failed, string? Replies, string? Message, long? SentBytes = null);
 
 // summary rows of the automatic runs (dbo.PushRun_Hourly)
 static class RunStore
@@ -111,7 +111,30 @@ static class RunStore
         return Convert.ToInt32(cmd.ExecuteScalar()) == 1;
     }
 
-    public const int MaxAttempts = 3;   // a run that failed before it sent anything is tried again, up to this many runs for one hour
+    // The size column (dbo.PushRun_Hourly.SentBytes, sql\10_add_SentBytes_PushRun_Hourly.sql) is optional: without it everything works, the
+    // Automatic tab just shows "-" for the size. Checked once a minute at most.
+    static bool hasSize; static DateTime sizeChecked = DateTime.MinValue;
+    public static bool HasSizeColumn(string connStr)
+    {
+        if (hasSize || DateTime.Now - sizeChecked < TimeSpan.FromMinutes(1)) return hasSize;
+        sizeChecked = DateTime.Now;
+        using var db = new SqlConnection(connStr); db.Open();
+        using var cmd = new SqlCommand("SELECT COL_LENGTH('dbo.PushRun_Hourly','SentBytes')", db);
+        hasSize = cmd.ExecuteScalar() is not (null or DBNull);
+        return hasSize;
+    }
+
+    // add = true: add to what the row has (a manual send of more meters for the same hour); false: set
+    public static void SetSentBytes(string connStr, int runId, long bytes, bool add)
+    {
+        if (!HasSizeColumn(connStr)) return;
+        using var db = new SqlConnection(connStr); db.Open();
+        using var cmd = new SqlCommand($"UPDATE dbo.PushRun_Hourly SET SentBytes = {(add ? "ISNULL(SentBytes,0) + @b" : "@b")} WHERE RunId=@id", db) { CommandTimeout = 120 };
+        cmd.Parameters.AddWithValue("@b", bytes); cmd.Parameters.AddWithValue("@id", runId);
+        cmd.ExecuteNonQuery();
+    }
+
+    public const int MaxAttempts = 3;  // a run that failed before it sent anything is tried again, up to this many runs for one hour
 
     // The hour has been handled: a run exists that did something (sent, nothing to send, stopped, missed ...). A run that FAILED before
     // it had anything to send (the database timed out while loading) does not count - the scheduler tries that hour again, up to MaxAttempts times.
@@ -164,7 +187,7 @@ Replies=@r, Message=@m, FinishedOn=CASE WHEN @fin=1 THEN GETDATE() ELSE Finished
     // recalculated from the hour's records in dbo.PushLog_Hourly (a meter sent again replaces its earlier record, so a failed meter that
     // is now accepted counts as accepted). The latest run row of the hour is updated; if the hour has no run row (the scheduler did not run
     // for it) one is added.
-    public static void SyncAfterManualSend(string connStr, DateTime date, int hour, int skipped, DateTime jobStarted, string? stoppedBecause)
+    public static void SyncAfterManualSend(string connStr, DateTime date, int hour, int skipped, DateTime jobStarted, string? stoppedBecause, long sentBytes = 0)
     {
         using var db = new SqlConnection(connStr); db.Open();
         int ok = 0, failed = 0;
@@ -197,6 +220,7 @@ Replies=@r, Message=@m, FinishedOn=CASE WHEN @fin=1 THEN GETDATE() ELSE Finished
             u.ExecuteNonQuery();
         }
         Update(connStr, runId.Value, state, ok + failed, 0, skipped, ok, failed, string.Join("; ", replies), note, true);
+        if (sentBytes > 0) SetSentBytes(connStr, runId.Value, sentBytes, true);
     }
 
     // different meters with a FAILED record on this reading date (any hour)
@@ -204,6 +228,15 @@ Replies=@r, Message=@m, FinishedOn=CASE WHEN @fin=1 THEN GETDATE() ELSE Finished
     {
         using var db = new SqlConnection(connStr); db.Open();
         using var cmd = new SqlCommand("SELECT COUNT(DISTINCT ServiceNo) FROM dbo.PushLog_Hourly WHERE ReadingDate=@d AND Status='FAILED'", db);
+        cmd.Parameters.AddWithValue("@d", date.Date);
+        return Convert.ToInt32(cmd.ExecuteScalar());
+    }
+
+    // how many DIFFERENT meters were accepted on the date, over all hours (a meter sent every hour counts once; manual sends count too)
+    public static int DistinctSent(string connStr, DateTime date)
+    {
+        using var db = new SqlConnection(connStr); db.Open();
+        using var cmd = new SqlCommand("SELECT COUNT(DISTINCT ServiceNo) FROM dbo.PushLog_Hourly WHERE ReadingDate=@d AND Status='OK'", db) { CommandTimeout = 120 };
         cmd.Parameters.AddWithValue("@d", date.Date);
         return Convert.ToInt32(cmd.ExecuteScalar());
     }
@@ -221,14 +254,15 @@ Replies=@r, Message=@m, FinishedOn=CASE WHEN @fin=1 THEN GETDATE() ELSE Finished
     {
         var list = new List<RunRow>();
         using var db = new SqlConnection(connStr); db.Open();
-        using var cmd = new SqlCommand(@"SELECT TOP (@t) RunId, ReadingDate, ReadingHour, StartedOn, FinishedOn, State, Planned, AlreadySent, Skipped, Accepted, Failed, Replies, Message
+        using var cmd = new SqlCommand($@"SELECT TOP (@t) RunId, ReadingDate, ReadingHour, StartedOn, FinishedOn, State, Planned, AlreadySent, Skipped, Accepted, Failed, Replies, Message,
+  {(HasSizeColumn(connStr) ? "SentBytes" : "CAST(NULL AS bigint)")}
 FROM dbo.PushRun_Hourly WHERE (@d IS NULL OR ReadingDate = @d) ORDER BY ReadingDate DESC, ReadingHour DESC, RunId DESC", db);
         cmd.Parameters.AddWithValue("@t", Math.Clamp(take, 1, 500));
         cmd.Parameters.AddWithValue("@d", date.HasValue ? date.Value.Date : DBNull.Value);
         using var r = cmd.ExecuteReader();
         while (r.Read())
             list.Add(new RunRow(r.GetInt32(0), r.GetDateTime(1), r.GetByte(2), r.GetDateTime(3), r.IsDBNull(4) ? null : r.GetDateTime(4), r.GetString(5),
-                r.GetInt32(6), r.GetInt32(7), r.GetInt32(8), r.GetInt32(9), r.GetInt32(10), r.IsDBNull(11) ? null : r.GetString(11), r.IsDBNull(12) ? null : r.GetString(12)));
+                r.GetInt32(6), r.GetInt32(7), r.GetInt32(8), r.GetInt32(9), r.GetInt32(10), r.IsDBNull(11) ? null : r.GetString(11), r.IsDBNull(12) ? null : r.GetString(12), r.IsDBNull(13) ? null : r.GetInt64(13)));
         return list;
     }
 

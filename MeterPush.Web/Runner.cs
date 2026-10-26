@@ -16,6 +16,7 @@ class Job
     public string? PlanId;
     public string? Error;
     public int Total, Index, Pushed, Failed;
+    public long SentBytes;                   // hourly: size of the requests sent (shown as KB in the Automatic tab)
     public Dictionary<string, int> Replies = new();
     public string? StoppedBecause;
     public readonly List<FailRow> Failures = new();   // meters the API did not accept, with the reply
@@ -237,6 +238,7 @@ static class Runner
                 var message = job.StoppedBecause != null ? $"stopped: {job.StoppedBecause}; {plan.ToSend.Count - job.Pushed - job.Failed} meter(s) not sent" : null;
                 RunStore.Update(connStr, runId, state, plan.ToSend.Count, already, plan.Skips.Count, job.Pushed, job.Failed,
                     string.Join("; ", job.Replies.OrderByDescending(r => r.Value).Select(r => $"{r.Key}: {r.Value}")), message, true);
+                RunStore.SetSentBytes(connStr, runId, job.SentBytes, false);
             }
             catch (Exception ex)
             {
@@ -250,7 +252,8 @@ static class Runner
         var (db, global) = Open(connStr);
         using var dbScope = db;
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(int.Parse(global.GetValueOrDefault("TIMEOUT_SEC", "60"))) };
-        var res = new HourlyPush(db, connStr, http, global, job.Log).Execute(sp.Plan, p =>
+        var hourly = new HourlyPush(db, connStr, http, global, job.Log);
+        var res = hourly.Execute(sp.Plan, p =>
         {
             job.Index = p.Index; job.Pushed = p.Pushed; job.Failed = p.Failed;
             if (p.Ok) return;
@@ -261,12 +264,13 @@ static class Runner
         job.Pushed = res.Pushed; job.Failed = res.Failed;
         job.Replies = res.Replies;
         job.StoppedBecause = res.StoppedBecause;
+        job.SentBytes = hourly.BytesSent;
         job.State = res.StoppedBecause != null ? "Stopped" : "Done";
 
         // a manual send of an hour also updates that hour in the Automatic tab (the scheduler's own run writes its row itself)
         if (!job.Scheduled && RunStore.Ready(connStr))
         {
-            try { RunStore.SyncAfterManualSend(connStr, sp.Plan.Date, sp.Plan.Hour, sp.Plan.Skips.Count, job.Started, res.StoppedBecause); }
+            try { RunStore.SyncAfterManualSend(connStr, sp.Plan.Date, sp.Plan.Hour, sp.Plan.Skips.Count, job.Started, res.StoppedBecause, job.SentBytes); }
             catch (Exception ex) { job.Log("Could not update the Automatic tab for this hour: " + ex.Message); }
         }
     }

@@ -3,9 +3,9 @@ using System.Globalization;
 using System.Text.RegularExpressions;
 using Microsoft.Data.SqlClient;
 
-// setHourly (shared by the web app). For the chosen date and hour, every meter's reading stamped exactly HH:00 is read straight from the
-// modem tables (full read), or only the meters needed (quick test, when a test limit is set); reading_time = HH:00:00. A later reading of the
-// meter (e.g. 12:30) does not matter. Same selection rule as the procedure dbo.PrBLSTotalDCWiseMeterDataInstantDay, but for the hour.
+// setHourly (shared by the web app). For the chosen date and hour, every meter's latest reading in the hour before it (after (HH-1):00:00, up
+// to HH:00:00; for hour 10 that is 09:00:01 - 10:00:00) is read straight from the modem tables (full read), or only the meters needed
+// (quick test, when a test limit is set); reading_time = HH:00:00. A later reading of the meter (e.g. 12:30) does not matter. Same selection rule as the procedure dbo.PrBLSTotalDCWiseMeterDataInstantDay, but for the hour.
 // The field rules (which value comes from which column, which are fixed) are the ones in Fields below.
 // Progress / "already sent" is kept in dbo.PushLog_Hourly (sql\05_create_PushLog_Hourly.sql), one row per (reading date, hour, service).
 class HourlyPush
@@ -97,31 +97,32 @@ class HourlyPush
         var done = logReady ? LoadDone(date, hour) : new HashSet<string>(StringComparer.Ordinal);
         if (limit > 0) return PlanQuick(date, hour, limit, ignoreLog, endpoint, logReady, services, done);
 
-        Log($"setHourly: reading the {hour:00}:00 reading of every meter for {date:yyyy-MM-dd}, straight from the meter tables...");
+        var win = Window(date, hour);
+        Log($"setHourly: reading every meter's latest reading after {win.From:yyyy-MM-dd HH:mm:ss} up to {win.To:yyyy-MM-dd HH:mm:ss}, straight from the meter tables...");
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var rows = ReadHour(date, hour);
-        Log($"setHourly: {rows.Count} meter(s) have a reading at {hour:00}:00 (read in {sw.Elapsed.TotalSeconds:0} s)");
+        Log($"setHourly: {rows.Count} meter(s) have a reading in that window (read in {sw.Elapsed.TotalSeconds:0} s)");
 
         var items = new List<HItem>(); var skips = new List<HSkip>();
         foreach (var (no, row) in rows.OrderBy(r => r.Key, StringComparer.Ordinal))
             Evaluate(no, row, services, done, date, hour, items, skips);
         foreach (var no in services.Keys.Where(k => !rows.ContainsKey(k)).OrderBy(k => k, StringComparer.Ordinal))
-            skips.Add(new HSkip(no, services[no].Unique, $"no reading at {hour:00}:00 on {date:yyyy-MM-dd}"));
+            skips.Add(new HSkip(no, services[no].Unique, $"no reading for {Window(date, hour).From:HH:mm} - {hour:00}:00 on {date:yyyy-MM-dd}"));
 
         var toSend = items.Where(i => ignoreLog || !i.Done).ToList();
         Log($"setHourly: {items.Count} meter(s) passed the checks for {hour:00}:00 - to send {toSend.Count}, already sent {items.Count(i => i.Done)}, skipped {skips.Count}");
         return new HPlan { Date = date, Hour = hour, Endpoint = endpoint, IgnoreLog = ignoreLog, LogReady = logReady, ProcRows = rows.Count, Items = items, Skips = skips, ToSend = toSend };
     }
 
-    // All meters, one pass over the modem tables: each meter's reading stamped exactly HH:00 on the date. Same selection rule as the
-    // procedure and MonthlyPush.ReadQuick (active service on feeder 6/11/19, MD kW and phase current present, newest CRTS among the
-    // rows, highest kWh when a service has rows in several tables) - but for the hour instead of "the newest reading of the day",
-    // so it does not matter whether the meter has reported a later reading (e.g. 12:30) since. Any error stops the read (no silent gaps).
+    // All meters, one pass over the modem tables: each meter's latest reading in the hour window (see Window). Same filters as the
+    // procedure and MonthlyPush.ReadQuick (active service on feeder 6/11/19, MD kW and phase current present, highest kWh when a
+    // service has rows in several tables) - but the row is the latest reading time inside the window instead of "the newest reading
+    // of the day", so it does not matter whether the meter has reported a later reading (e.g. 12:30) since. Any error stops the read (no silent gaps).
     Dictionary<string, MonthlyPush.Reading> ReadHour(DateTime date, int hour)
     {
         var tables = MonthlyPush.LoadServiceTables(db).Values.SelectMany(t => t).Distinct().OrderBy(t => t, StringComparer.Ordinal).ToList();
-        var day = date.ToString("yyyy-MM-dd", Inv);
-        var from = $"{day} {hour:00}:00:00"; var to = $"{day} {hour:00}:00:59";
+        var (wFrom, wTo) = Window(date, hour);
+        var from = wFrom.ToString("yyyy-MM-dd HH:mm:ss", Inv); var to = wTo.ToString("yyyy-MM-dd HH:mm:ss", Inv);
         var parallelism = Math.Max(1, int.Parse(global.GetValueOrDefault("PROC_PARALLELISM", "5")));
         var result = new Dictionary<string, MonthlyPush.Reading>(StringComparer.Ordinal);
         var gate = new object();
@@ -145,6 +146,14 @@ class HourlyPush
         return result;
     }
 
+    // The readings that belong to the hour: after (hour - 1):00:00, up to and including hour:00:00 (for the 10:00 hour: 09:00:01 - 10:00:00).
+    // The start is left out so the 09:00:00 reading belongs to the 09:00 hour only and no reading is sent for two hours.
+    internal static (DateTime From, DateTime To) Window(DateTime date, int hour)
+    {
+        var to = date.Date.AddHours(hour);
+        return (to.AddHours(-1), to);
+    }
+
     // across tables the procedure keeps the row with the highest CumulativeEnergykWh (compared as text), then the latest time
     static bool Better(MonthlyPush.Reading a, MonthlyPush.Reading b)
     {
@@ -164,13 +173,13 @@ FROM (SELECT DD.DCSNo AS [DC SNo], SD.ServiceNo AS [Service No], MD.MeterSNo AS 
              DT.CumulativeEnergykWh AS [Meter Reading(kWh)], DT.CumulativeEnergykVAh AS [Meter Reading(kVAh)],
              DT.MDkW AS [MD kW], DT.MDkWTS AS [MD kW TS], DT.MDkVA AS [MD kVA], DT.MDkVATS AS [MD kVA TS], STD.STATUSDESCRIPTION AS [Event Status],
              CONVERT(VARCHAR(16), DT.REALTIMECLOCKDATEANDTIME, 121) AS [Date & Time],
-             RANK() OVER (PARTITION BY SD.ServiceNo ORDER BY DT.CRTS DESC) AS RK
+             RANK() OVER (PARTITION BY SD.ServiceNo ORDER BY DT.REALTIMECLOCKDATEANDTIME DESC, DT.CRTS DESC) AS RK
       FROM {MonthlyPush.Br(table)} AS DT
       LEFT OUTER JOIN ServiceDetails SD ON SD.ServiceConnId=DT.ServiceconnId
       LEFT OUTER JOIN DCDetails DD ON SD.DCId=DD.DCId
       LEFT OUTER JOIN MeterDetails MD ON MD.MeterId=DT.MeterId
       LEFT OUTER JOIN STATUSDETAILS STD ON STD.STATUSCODE=MD.STATUSCODE
-      WHERE DT.REALTIMECLOCKDATEANDTIME BETWEEN @from AND @to
+      WHERE DT.REALTIMECLOCKDATEANDTIME > @from AND DT.REALTIMECLOCKDATEANDTIME <= @to
         AND SD.IsActive=1 AND DT.NORMALPHASECURRENT IS NOT NULL AND DT.MDKW IS NOT NULL AND SD.FEEDERID IN (6,11,19)) A
 WHERE RK=1", conn) { CommandTimeout = 300 };
         cmd.Parameters.Add("@from", System.Data.SqlDbType.VarChar, 30).Value = from;
@@ -197,7 +206,8 @@ WHERE RK=1", conn) { CommandTimeout = 300 };
 
         var stamp = row.GetValueOrDefault("Date & Time");
         if (!DateTime.TryParseExact(stamp?.Trim(), "yyyy-MM-dd HH:mm", Inv, DateTimeStyles.None, out var at)) { Skip(svc.Unique, "no Date & Time in the reading"); return; }
-        if (at != date.Date.AddHours(hour)) { Skip(svc.Unique, $"latest reading is at {at:yyyy-MM-dd HH:mm}, not exactly {hour:00}:00"); return; }
+        var (wFrom, wTo) = Window(date, hour);
+        if (at < wFrom || at > wTo) { Skip(svc.Unique, $"latest reading is at {at:yyyy-MM-dd HH:mm}, outside {wFrom:HH:mm} - {wTo:HH:mm}"); return; }
 
         var values = BuildValues(date, hour, row, svc);
         var missing = Needed.Where(n => string.IsNullOrWhiteSpace(values[n])).ToList();
@@ -217,7 +227,7 @@ WHERE RK=1", conn) { CommandTimeout = 300 };
     // ------------------------------------------------------------ quick test (a test limit is set)
     // Only candidate meters are read, straight from their own modem table, with the same selection rule the procedure uses
     // (MonthlyPush.ReadQuick: the day's latest row, MD kW and phase current present, highest kWh across tables), in batches
-    // until `limit` meters have a reading exactly at the chosen hour and pass the checks.
+    // until `limit` meters have a reading in the chosen hour's window and pass the checks.
 
     const int QuickBatch = 20, QuickMaxExamined = 1500;
 
@@ -244,7 +254,7 @@ WHERE RK=1", conn) { CommandTimeout = 300 };
             {
                 using var conn = new SqlConnection(connStr);
                 conn.Open();
-                fetched[i] = MonthlyPush.ReadQuick(conn, tables[batch[i].ServiceNo], batch[i].ServiceNo, date, $"{hour:00}:00:00", $"{hour:00}:00:59");
+                fetched[i] = MonthlyPush.ReadQuick(conn, tables[batch[i].ServiceNo], batch[i].ServiceNo, date, window: Window(date, hour));
             });
             for (int i = 0; i < batch.Count && items.Count < limit; i++)
             {
@@ -291,8 +301,12 @@ WHERE RK=1", conn) { CommandTimeout = 300 };
 
     // ------------------------------------------------------------ send
 
+    // bytes of the SOAP requests sent by the last Execute (every record that was posted, accepted or not)
+    internal long BytesSent { get; private set; }
+
     internal MonthlyPush.ExecResult Execute(HPlan plan, Action<MonthlyPush.ExecProgress>? onProgress = null, CancellationToken ct = default)
     {
+        BytesSent = 0;
         if (!LogTableExists()) throw new InvalidOperationException("dbo.PushLog_Hourly does not exist - run sql\\05_create_PushLog_Hourly.sql first.");
         Log($"setHourly: pushing {plan.ToSend.Count} record(s) for {plan.Label} to {plan.Endpoint}");
 
@@ -308,6 +322,7 @@ WHERE RK=1", conn) { CommandTimeout = 300 };
                 (it, ok, detail) => // runs one at a time (see ParallelSend)
                 {
                     QueueLog(plan, it, ok ? "OK" : "FAILED", detail);
+                    BytesSent += System.Text.Encoding.UTF8.GetByteCount(it.Xml);
                     index++;
                     if (ok)
                     {

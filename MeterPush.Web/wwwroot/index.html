@@ -197,7 +197,7 @@
         <button class="primary" id="hrPreview">Preview</button>
       </div>
       <p class="muted small" style="margin:10px 0 0" id="hrNote"></p>
-      <p class="muted small" style="margin:6px 0 0">The date and hour start as the current date and hour. <code>reading_time</code> is sent as the hour (for example 12:00:00). Each meter's reading stamped exactly at that hour (for example 11:00, not 11:30) is sent, even if the meter has reported a later reading since; meters with no reading at that hour are listed under Skipped. Reading all meters takes about a minute; with a test number filled in, only the meters needed are read (seconds).</p>
+      <p class="muted small" style="margin:6px 0 0">The date and hour start as the current date and hour. <code>reading_time</code> is sent as the hour (for example 12:00:00). For the chosen hour (for example 11:00) each meter's latest reading after 10:00:00 up to 11:00:00 is sent, even if the meter has reported a later reading since; meters with no reading in that window are listed under Skipped. Reading all meters takes about a minute; with a test number filled in, only the meters needed are read (seconds).</p>
       <div id="hrMsg"></div>
     </div>
 
@@ -263,7 +263,7 @@
         <button class="primary" id="scToggle" disabled>...</button>
         <span class="muted small" id="scNext"></span>
       </div>
-      <p class="muted small" style="margin:10px 0 0">When ON, the program pushes the hourly data by itself at the <b>start of every hour</b> for the <b>previous hour</b>: at 20:00 it pushes the <b>19:00</b> readings, at 21:00 the 20:00 readings, and so on (at 00:00 it pushes 23:00 of the day before). Each meter's reading stamped exactly that hour is sent, whatever later readings (19:30 ...) the meter has; meters already sent for that hour are not sent again. If it was busy or the program had just started, it still starts until the end of that clock hour (59 minutes past). It only runs while the program (start-web.bat) is running. Nothing is sent when it is OFF.</p>
+      <p class="muted small" style="margin:10px 0 0">When ON, the program pushes the hourly data by itself at the <b>start of every hour</b> for the <b>previous hour</b>: at 20:00 it pushes the <b>19:00</b> readings, at 21:00 the 20:00 readings, and so on (at 00:00 it pushes 23:00 of the day before). Each meter's latest reading in the hour before it (for the 19:00 readings: after 18:00:00 up to 19:00:00) is sent, whatever later readings the meter has; meters already sent for that hour are not sent again. If it was busy or the program had just started, it still starts until the end of that clock hour (59 minutes past). It only runs while the program (start-web.bat) is running. Nothing is sent when it is OFF.</p>
       <div id="scMsg"></div>
       <div id="scRunning" class="msg warn hidden"></div>
     </div>
@@ -437,8 +437,8 @@ async function loadHPlan(id) {
   $('hrStSend').textContent = hPlan.toSend; $('hrStDone').textContent = hPlan.alreadySent; $('hrStSkip').textContent = hPlan.skipped;
   const hh = String(hPlan.hour).padStart(2, '0') + ':00';
   $('hrBreakdown').innerHTML = (hPlan.quick
-    ? `<div class="muted small" style="margin-bottom:6px"><b>Quick test:</b> only ${hPlan.examined} meter(s) were checked (until ${hPlan.limit} had a reading exactly at ${hh}), so the counts below are not for the whole day. Leave the test box empty for the full run.</div>`
-    : `<div class="muted small" style="margin-bottom:6px">${hPlan.procRows} meter(s) have a reading stamped exactly ${hh}; ${hPlan.eligible} of them passed the checks.</div>`)
+    ? `<div class="muted small" style="margin-bottom:6px"><b>Quick test:</b> only ${hPlan.examined} meter(s) were checked (until ${hPlan.limit} had a reading in the hour up to ${hh}), so the counts below are not for the whole day. Leave the test box empty for the full run.</div>`
+    : `<div class="muted small" style="margin-bottom:6px">${hPlan.procRows} meter(s) have a reading in the hour up to ${hh}; ${hPlan.eligible} of them passed the checks.</div>`)
     + (hPlan.skippedBreakdown.length ? '<b>Why meters are skipped:</b> ' + hPlan.skippedBreakdown.map(b => `${esc(b.reason)} (${b.count})`).join(' &middot; ') : '')
     + (hPlan.logReady ? '' : '<div class="msg warn">The table dbo.PushLog_Hourly does not exist yet, so Send is disabled. Run sql\\05_create_PushLog_Hourly.sql in SQL Server first, then Preview again.</div>');
   $('hrSend').disabled = hPlan.toSend === 0 || hPlan.sent || !hPlan.logReady;
@@ -597,15 +597,16 @@ async function loadSched() {
     const dayWord = scDate === dayStr(0) ? 'today' : 'on ' + scDate;
     const running = last && last.state === 'Running';
     $('scStats').innerHTML = rows.length
-      ? `<div class="stat ok"><b>${running ? '...' : last.accepted}</b><span>accepted in the latest push<br>(${hhmm(last.hour)} readings${running ? ', still running' : ''})</span></div>` +
+      ? (r.distinctSent != null ? `<div class="stat ok"><b>${r.distinctSent.toLocaleString()}</b><span>different meters sent ${dayWord}<br>(accepted, all hours)</span></div>` : '') +
+        `<div class="stat ok"><b>${running ? '...' : last.accepted}</b><span>accepted in the latest push<br>(${hhmm(last.hour)} readings${running ? ', still running' : ''})</span></div>` +
         `<div class="stat bad"><b>${running ? '...' : last.failed}</b><span>failed in the latest push<br>(${hhmm(last.hour)} readings${running ? ', still running' : ''})</span></div>` +
         `<div class="stat warn"><b>${failedDay}</b><span>failed ${dayWord}, all hours` +
         `${r.distinctFailed != null ? '<br>(' + r.distinctFailed + ' different meter' + (r.distinctFailed === 1 ? '' : 's') + ')' : ''}</span></div>`
       : '';
-    $('scTable').innerHTML = '<tr><th>Reading</th><th>Started</th><th>Took</th><th>Result</th><th>To send</th><th>Accepted</th><th>Failed</th><th>Already sent</th><th>Skipped</th><th>Notes</th></tr>' +
+    $('scTable').innerHTML = '<tr><th>Reading</th><th>Started</th><th>Took</th><th>Result</th><th>To send</th><th>Accepted</th><th>Failed</th><th>Already sent</th><th>Skipped</th><th>Notes</th><th>Size (KB)</th></tr>' +
       rows.map((x, i) => {
         const took = x.finished ? Math.max(0, Math.round((new Date(x.finished) - new Date(x.started)) / 1000)) + ' s' : '';
-        return `<tr class="click" data-i="${i}"><td>${esc(x.date)} <b>${hhmm(x.hour)}</b></td><td>${esc(timeOf(x.started))}</td><td>${took}</td><td>${runPill(x.state)}</td><td>${x.planned}</td><td>${x.accepted}</td><td>${x.failed}</td><td>${x.alreadySent}</td><td>${x.skipped}</td><td class="wrap muted">${esc(x.message || x.replies || '')}</td></tr>`;
+        return `<tr class="click" data-i="${i}"><td>${esc(x.date)} <b>${hhmm(x.hour)}</b></td><td>${esc(timeOf(x.started))}</td><td>${took}</td><td>${runPill(x.state)}</td><td>${x.planned}</td><td>${x.accepted}</td><td>${x.failed}</td><td>${x.alreadySent}</td><td>${x.skipped}</td><td class="wrap muted">${esc(x.message || x.replies || '')}</td><td>${x.sizeKb != null ? x.sizeKb.toLocaleString(undefined, { maximumFractionDigits: 1 }) + ' KB' : '-'}</td></tr>`;
       }).join('');
     $('scTable').querySelectorAll('tr.click').forEach(tr => tr.onclick = () => showRun(rows[+tr.dataset.i]));
     $('scNote').textContent = rows.length ? 'Click a run to see the meters that failed and to download them.' : (s.ready ? 'No automatic run for ' + scDate + '.' : '');
@@ -631,7 +632,7 @@ $('scToggle').onclick = async () => {
 async function showRun(r) {
   $('detailTitle').textContent = `Automatic run for ${r.date} ${hhmm(r.hour)}`;
   let html = `<p class="small">${runPill(r.state)} &nbsp; <span class="muted">started ${esc((r.started || '').replace('T', ' ').slice(0, 19))}${r.finished ? ', finished ' + esc(timeOf(r.finished)) : ''}</span></p>` +
-    kv([['Meters to send', r.planned], ['Accepted by the API', r.accepted], ['Failed', r.failed], ['Already sent before', r.alreadySent], ['Skipped (missing values, MD above the limit ...)', r.skipped], ['API replies', r.replies || ''], ['Notes', r.message || '']]);
+    kv([['Meters to send', r.planned], ['Accepted by the API', r.accepted], ['Failed', r.failed], ['Already sent before', r.alreadySent], ['Skipped (missing values, MD above the limit ...)', r.skipped], ['Size of the requests sent', r.sizeKb != null ? r.sizeKb.toLocaleString(undefined, { maximumFractionDigits: 1 }) + ' KB' : '-'], ['API replies', r.replies || ''], ['Notes', r.message || '']]);
   // Only the counts are kept for succeeded meters. Nothing is read for the run until its row is clicked; then only the FAILED meters
   // are loaded (a handful), and the Excel (failed meters only) is built when its button is pressed.
   html += '<div id="rdList">' + (r.failed > 0 ? '<p class="muted small">Loading the failed meters...</p>' : '<p class="muted small">No failed meters in this run.</p>') + '</div>' +
