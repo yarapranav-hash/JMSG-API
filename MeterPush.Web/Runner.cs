@@ -57,6 +57,9 @@ static class Runner
     static Job? active;
     public static readonly ConcurrentDictionary<string, Job> Jobs = new();
     public static readonly ConcurrentDictionary<string, StoredPlan> Plans = new();
+    // opening-readings files uploaded on the Run tab (kept in memory only, dropped after 6 hours)
+    public sealed record StoredOpening(string Name, Dictionary<string, OpeningRow> Rows, DateTime Created);
+    public static readonly ConcurrentDictionary<string, StoredOpening> Openings = new();
 
     public static Job? Active { get { lock (Gate) return active is { State: "Running" } ? active : null; } }
 
@@ -102,13 +105,13 @@ static class Runner
     }
 
     // auto = Automatic mode: after the preview is built the records are sent straight away, in the same job (no review step)
-    public static Job? StartPreview(string connStr, DateTime date, int? limit, bool ignoreLog, bool auto, out string? error) =>
+    public static Job? StartPreview(string connStr, DateTime date, int? limit, bool ignoreLog, bool auto, StoredOpening? opening, out string? error) =>
         TryStart("preview", date.ToString("yyyy-MM-dd"), job =>
         {
             var (db, global) = Open(connStr);
             using var dbScope = db;
             using var http = new HttpClient();
-            var opts = new Opts { Op = "monthly", Date = date, Limit = limit ?? 0, IgnoreLog = ignoreLog, DryRun = true };
+            var opts = new Opts { Op = "monthly", Date = date, Limit = limit ?? 0, IgnoreLog = ignoreLog, DryRun = true, Opening = opening?.Rows, OpeningName = opening?.Name };
             var plan = new MonthlyPush(db, connStr, http, global, opts, job.Log).Plan();
             var sp = new StoredPlan { Plan = plan, Opts = opts };
             Plans[sp.Id] = sp;

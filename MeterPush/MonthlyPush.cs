@@ -63,7 +63,8 @@ class MonthlyPush
     internal PlanResult Plan()
     {
         var pushDate = opts.Date ?? DateTime.Today;
-        var oldDate = pushDate.AddMonths(-1);
+        var openDates = OpeningDates(pushDate);
+        var oldDate = openDates[0]; // the opening reading date: last day of the month before the closing month
         var limit = opts.Limit > 0 ? opts.Limit : int.MaxValue;
 
         var prms = LoadParams();
@@ -73,35 +74,44 @@ class MonthlyPush
             return new PlanResult(pushDate, global["ENDPOINT"], prms, new List<Item>(), new List<Skipped>(), new List<Item>());
         }
 
-        Log($"setMonthly: push date {pushDate:yyyy-MM-dd}, opening readings from {oldDate:yyyy-MM-dd}");
+        var closeDates = ClosingDates(pushDate, ClosingLookback());
+        Log($"setMonthly: push date {pushDate:yyyy-MM-dd}, opening readings from {oldDate:yyyy-MM-dd}, closing readings from {closeDates.First():yyyy-MM-dd}" + (closeDates.Count > 1 ? $" (then {closeDates.Count - 1} day(s) before)" : ""));
 
         // every procedure call we may need, run in parallel (each on its own connection):
-        //  - push date (closing) and opening date, plus the following OPENING_FORWARD_DAYS days for services with no opening reading
+        //  - closing: last day of the month before the push date, plus up to CLOSING_LOOKBACK_DAYS earlier days for services with no reading that day
+        //  - opening date, plus the following OPENING_FORWARD_DAYS days for services with no opening reading
         //  - PROC_PREVEND params (rmd_kva, rmd_kwh): last day of the month before the push date, plus up to MD_LOOKBACK_DAYS earlier days
-        var forward = int.Parse(global.GetValueOrDefault("OPENING_FORWARD_DAYS", "1"));
         var lookback = int.Parse(global.GetValueOrDefault("MD_LOOKBACK_DAYS", "7"));
         var monthStart = pushDate.AddDays(-pushDate.Day).AddDays(1).AddMonths(-1); // first day of the previous month
         var usesMd = prms.Any(p => p.Type == "PROC_PREVEND");
-        var forwardDates = Enumerable.Range(1, forward).Select(i => oldDate.AddDays(i)).ToList();
+        var fallbackDates = openDates.Skip(1).ToList(); // opening: day before, then the 1st to 5th of the closing month
         var mdDates = usesMd
             ? Enumerable.Range(0, lookback + 1).Select(i => pushDate.AddDays(-pushDate.Day - i)).Where(d => d >= monthStart).ToList()
             : new List<DateTime>();
         // a test limit: read only the meters needed instead of every meter (see PlanQuick)
-        if (opts.Limit > 0 && !opts.FullRead) return PlanQuick(prms, pushDate, oldDate, forward, lookback, forwardDates, mdDates);
+        if (opts.Limit > 0 && !opts.FullRead) return PlanQuick(prms, pushDate, openDates, lookback, mdDates, closeDates);
 
-        var results = CallMany(new[] { pushDate, oldDate }.Concat(forwardDates).Concat(mdDates).Distinct().ToList());
+        var results = CallMany(closeDates.Concat(openDates).Concat(mdDates).Distinct().ToList());
 
-        var newR = results[pushDate];
+        // closing reading: the latest reading of the last day of the previous month; a service with none that day takes the previous day that has one
+        var newR = new Dictionary<string, Reading>(StringComparer.Ordinal);
+        foreach (var d in closeDates)
+        {
+            var added = 0;
+            foreach (var (no, r) in results[d])
+                if (newR.TryAdd(no, r)) added++;
+            Log($"setMonthly: {d:yyyy-MM-dd} (closing) gave a closing reading for {added} service(s)");
+        }
         var oldR = new Dictionary<string, Reading>(results[oldDate], StringComparer.Ordinal);
-        Log($"setMonthly: procedure returned {newR.Count} service(s) for {pushDate:yyyy-MM-dd}, {oldR.Count} for {oldDate:yyyy-MM-dd}");
+        Log($"setMonthly: {newR.Count} service(s) with a closing reading, {oldR.Count} service(s) with a reading on {oldDate:yyyy-MM-dd}");
 
-        // opening reading: a service with no reading on the opening date takes the latest reading of the next day that has one
-        foreach (var d in forwardDates)
+        // opening reading: a service with no reading on the opening date takes the latest reading of the first following fallback date that has one
+        foreach (var d in fallbackDates)
         {
             var added = 0;
             foreach (var (no, r) in results[d])
                 if (newR.ContainsKey(no) && oldR.TryAdd(no, r)) added++;
-            Log($"setMonthly: {d:yyyy-MM-dd} (opening, forward) gave an opening reading for {added} more service(s)");
+            Log($"setMonthly: {d:yyyy-MM-dd} (opening fallback) gave an opening reading for {added} more service(s)");
         }
         Log($"setMonthly: {newR.Keys.Count(k => !oldR.ContainsKey(k))} service(s) without an opening reading");
 
@@ -118,7 +128,7 @@ class MonthlyPush
 
         var services = LoadServices();
         var done = LoadDone(pushDate);
-        var ctx = MakeCtx(prms, pushDate, oldDate, forward, lookback, mdDates, services, done, oldR, prevEndR);
+        var ctx = MakeCtx(prms, pushDate, openDates, lookback, mdDates, services, done, oldR, prevEndR);
 
         // ---- phase 1: build everything that would be sent (nothing is sent or written to the log yet)
         prmList = prms;
@@ -130,25 +140,69 @@ class MonthlyPush
 
         // --ignore-log: services already logged OK are sent again too
         var toSend = items.Where(i => opts.IgnoreLog || !i.Done).Take(limit).ToList();
-        return new PlanResult(pushDate, global["ENDPOINT"], prms, items, skips, toSend);
+        LogOpeningFile();
+        return new PlanResult(pushDate, global["ENDPOINT"], prms, items, skips, toSend)
+            { OpeningFileName = opts.OpeningName, OpeningFromFile = openFromFile, OpeningMismatch = openMismatch };
+    }
+
+    // closing reading dates in order of preference: the last day of the month before the push date, then CLOSING_LOOKBACK_DAYS earlier days
+    // (never before the first day of that month)
+    int ClosingLookback() => Math.Max(0, int.Parse(global.GetValueOrDefault("CLOSING_LOOKBACK_DAYS", "1")));
+
+    // opening reading dates in order of preference. For a push date in November (closing = 31 Oct): 30 Sep, then 29 Sep, then 1 Oct, 2 Oct, 3 Oct, 4 Oct, 5 Oct.
+    // Whatever the day of the push date, these only depend on its month. The first date that has a reading for a meter is used.
+    internal static List<DateTime> OpeningDates(DateTime pushDate)
+    {
+        var closingMonthStart = pushDate.AddDays(-pushDate.Day).AddDays(1 - pushDate.AddDays(-pushDate.Day).Day); // first day of the month before the push date
+        var last = closingMonthStart.AddDays(-1);                                                                // last day of the month before that
+        return new[] { last, last.AddDays(-1) }.Concat(Enumerable.Range(0, 5).Select(i => closingMonthStart.AddDays(i))).ToList();
+    }
+
+    static List<DateTime> ClosingDates(DateTime pushDate, int lookback)
+    {
+        var monthStart = pushDate.AddDays(-pushDate.Day).AddDays(1).AddMonths(-1);
+        return Enumerable.Range(0, lookback + 1).Select(i => pushDate.AddDays(-pushDate.Day - i)).Where(d => d >= monthStart).ToList();
     }
 
     // ------------------------------------------------------------ checks (shared by the full plan and the quick test)
 
-    sealed record EvalCtx(List<Param> Prms, DateTime PushDate, DateTime OldDate, int Forward, int Lookback, List<DateTime> MdDates,
+    sealed record EvalCtx(List<Param> Prms, DateTime PushDate, List<DateTime> OpenDates, int Lookback, List<DateTime> MdDates,
         Dictionary<string, Svc> Services, HashSet<string> Done, Dictionary<string, Reading> OldR, Dictionary<string, Reading> PrevEndR,
-        decimal MaxIncreasePct, decimal MaxMd);
+        decimal MaxIncreasePct, decimal MaxMd, Dictionary<string, OpeningRow>? Opening);
 
-    EvalCtx MakeCtx(List<Param> prms, DateTime pushDate, DateTime oldDate, int forward, int lookback, List<DateTime> mdDates,
+    EvalCtx MakeCtx(List<Param> prms, DateTime pushDate, List<DateTime> openDates, int lookback, List<DateTime> mdDates,
         Dictionary<string, Svc> services, HashSet<string> done, Dictionary<string, Reading> oldR, Dictionary<string, Reading> prevEndR) =>
-        new(prms, pushDate, oldDate, forward, lookback, mdDates, services, done, oldR, prevEndR,
+        new(prms, pushDate, openDates, lookback, mdDates, services, done, oldR, prevEndR,
             decimal.Parse(global.GetValueOrDefault("MONTHLY_MAX_INCREASE_PCT", "120"), Inv),
-            decimal.Parse(global.GetValueOrDefault("MONTHLY_MAX_MD", "6"), Inv));
+            decimal.Parse(global.GetValueOrDefault("MONTHLY_MAX_MD", "6"), Inv), opts.Opening);
+
+    // ---- opening readings from an uploaded file (Opts.Opening): matched by meter number (the closing reading's MSN), then cross-checked on the service number.
+    // A meter that is not in the file, or whose service number differs, keeps the normal opening reading (push date minus one month).
+    int openFromFile, openMismatch;
+
+    static string NormSvc(string s) => s.Replace(" ", "").Trim().ToUpperInvariant();
+
+    Reading? OpeningFromFile(EvalCtx c, string serviceNo, Reading cur)
+    {
+        var msn = cur.GetValueOrDefault("MSN")?.Trim().ToUpperInvariant();
+        if (string.IsNullOrEmpty(msn) || !c.Opening!.TryGetValue(msn, out var o)) return null;
+        if (o.ServiceNo != null && NormSvc(o.ServiceNo) != NormSvc(serviceNo)) { openMismatch++; return null; }
+        var date = (o.Date ?? c.OpenDates[0]).ToString("yyyy-MM-dd", Inv);
+        var r = new Reading { [KwhColumn] = o.Kwh.ToString(Inv), [ReadDate] = date };
+        openFromFile++;
+        return r;
+    }
+
+    void LogOpeningFile()
+    {
+        if (opts.Opening == null) return;
+        Log($"setMonthly: opening readings from file {opts.OpeningName}: {openFromFile} meter(s) used it, {openMismatch} had a different service number in the file (normal opening used)");
+    }
 
     // For each service that has a reading on the push date: apply every rule, then add it to items (will be sent) or skips (with the reason).
     void Evaluate(IEnumerable<KeyValuePair<string, Reading>> rows, EvalCtx c, List<Item> items, List<Skipped> skips)
     {
-        var (prms, pushDate, oldDate, forward, lookback, mdDates) = (c.Prms, c.PushDate, c.OldDate, c.Forward, c.Lookback, c.MdDates);
+        var (prms, pushDate, openDates, lookback, mdDates) = (c.Prms, c.PushDate, c.OpenDates, c.Lookback, c.MdDates);
         foreach (var (serviceNo, cur) in rows)
         {
             var isDone = c.Done.Contains(serviceNo);
@@ -162,7 +216,8 @@ class MonthlyPush
             var unique = svc.Unique!;
 
             // opening reading: only used for the sanity checks below, it is NOT sent
-            if (!c.OldR.TryGetValue(serviceNo, out var old)) { Skip(unique, forward > 0 ? $"no reading for {oldDate:yyyy-MM-dd} or the next {forward} day(s) (opening)" : $"no reading for {oldDate:yyyy-MM-dd} (opening)"); continue; }
+            var old = c.Opening != null ? OpeningFromFile(c, serviceNo, cur) : null;
+            if (old == null && !c.OldR.TryGetValue(serviceNo, out old)) { Skip(unique, $"no reading for {openDates[0]:yyyy-MM-dd}, the day before, or {openDates[2]:yyyy-MM-dd} to {openDates[^1]:yyyy-MM-dd} (opening)"); continue; }
 
             var prevEnd = c.PrevEndR.GetValueOrDefault(serviceNo);
             info = new Info(null, old.GetValueOrDefault(ReadDate), prevEnd?.GetValueOrDefault(ReadDate));
@@ -186,7 +241,7 @@ class MonthlyPush
             info = info with { OpeningKwh = openKwh };
 
             var diff = closeKwh - openKwh;
-            if (diff < 0) { Skip(unique, $"closing < opening (consumed {diff:0.##}) - meter replaced/rolled over?"); continue; }
+            if (Math.Round(diff, 2) < -1) { Skip(unique, $"closing < opening (consumed {diff:0.##}) - meter replaced/rolled over?"); continue; }
 
             // hold back services whose kWh jumped by more than maxIncreasePct between opening and closing
             // opening 0: any positive closing is an unbounded increase
@@ -348,7 +403,8 @@ class MonthlyPush
 
     const int QuickBatch = 20, QuickMaxExamined = 600;
 
-    PlanResult PlanQuick(List<Param> prms, DateTime pushDate, DateTime oldDate, int forward, int lookback, List<DateTime> forwardDates, List<DateTime> mdDates)
+    PlanResult PlanQuick(List<Param> prms, DateTime pushDate, List<DateTime> openDates, int lookback, List<DateTime> mdDates,
+        List<DateTime> closeDates)
     {
         var sw = Stopwatch.StartNew();
         var limit = opts.Limit;
@@ -359,7 +415,7 @@ class MonthlyPush
         var tables = LoadServiceTables(db);
         var oldR = new Dictionary<string, Reading>(StringComparer.Ordinal);
         var prevEndR = new Dictionary<string, Reading>(StringComparer.Ordinal);
-        var ctx = MakeCtx(prms, pushDate, oldDate, forward, lookback, mdDates, services, done, oldR, prevEndR);
+        var ctx = MakeCtx(prms, pushDate, openDates, lookback, mdDates, services, done, oldR, prevEndR);
 
         prmList = prms;
         dataCols = LoadDataColumns();
@@ -374,7 +430,6 @@ class MonthlyPush
         var skips = new List<Skipped>();
         int examined = 0, noReading = 0;
         var parallelism = Math.Max(1, int.Parse(global.GetValueOrDefault("PROC_PARALLELISM", "5")));
-        var openingDates = new[] { oldDate }.Concat(forwardDates).ToList();
 
         for (int pos = 0; pos < candidates.Count && pos < QuickMaxExamined && items.Count < limit; pos += QuickBatch)
         {
@@ -385,10 +440,11 @@ class MonthlyPush
                 using var conn = new SqlConnection(connStr);
                 conn.Open();
                 var no = batch[i].ServiceNo;
-                var cur = ReadQuick(conn, tables[no], no, pushDate);
-                if (cur == null) return; // no reading on the push date: not a meter of this run
+                Reading? cur = null;
+                foreach (var d in closeDates) { cur = ReadQuick(conn, tables[no], no, d); if (cur != null) break; }
+                if (cur == null) return; // no closing reading: not a meter of this run
                 Reading? old = null, prev = null;
-                foreach (var d in openingDates) { old = ReadQuick(conn, tables[no], no, d); if (old != null) break; }
+                foreach (var d in openDates) { old = ReadQuick(conn, tables[no], no, d); if (old != null) break; }
                 foreach (var d in mdDates) { prev = ReadQuick(conn, tables[no], no, d); if (prev != null) break; }
                 fetched[i] = (cur, old, prev);
             });
@@ -403,13 +459,15 @@ class MonthlyPush
                 if (prev != null) prevEndR[no] = prev;
                 Evaluate(new[] { KeyValuePair.Create(no, cur) }, ctx, items, skips);
             }
-            Log($"setMonthly: checked {examined} meter(s): {items.Count} ready, {skips.Count} skipped, {noReading} with no reading on {pushDate:yyyy-MM-dd} ({sw.Elapsed.TotalSeconds:0} s)");
+            Log($"setMonthly: checked {examined} meter(s): {items.Count} ready, {skips.Count} skipped, {noReading} with no closing reading on {closeDates.FirstOrDefault():yyyy-MM-dd} or the {closeDates.Count - 1} day(s) before ({sw.Elapsed.TotalSeconds:0} s)");
         }
         if (items.Count < limit) Log($"setMonthly: only {items.Count} meter(s) found after checking {examined} candidate(s)");
         Log($"setMonthly: quick test done in {sw.Elapsed.TotalSeconds:0} s");
 
         var toSend = items.Where(i => opts.IgnoreLog || !i.Done).Take(limit).ToList();
-        return new PlanResult(pushDate, global["ENDPOINT"], prms, items, skips, toSend) { Quick = true, Examined = examined };
+        LogOpeningFile();
+        return new PlanResult(pushDate, global["ENDPOINT"], prms, items, skips, toSend)
+            { Quick = true, Examined = examined, OpeningFileName = opts.OpeningName, OpeningFromFile = openFromFile, OpeningMismatch = openMismatch };
     }
 
     // service -> the modem tables that hold its readings (the same tables the procedure walks: active DC -> modem IMEI table)
@@ -580,6 +638,9 @@ WHERE RK=1", conn) { CommandTimeout = 300 };
         public bool Quick { get; init; }       // quick test: only some meters were read, so the counts are not for the whole day
         public int Examined { get; init; }     // quick test: how many meters were looked at
         public string? FileName { get; init; } // set when the records came from an uploaded file
+        public string? OpeningFileName { get; init; } // set when opening readings were taken from an uploaded file
+        public int OpeningFromFile { get; init; }     // meters checked with an opening reading from that file
+        public int OpeningMismatch { get; init; }     // meters in the file under another service number (normal opening used)
         public PlanResult(DateTime pushDate, string endpoint, List<Param> prms, List<Item> items, List<Skipped> skips, List<Item> toSend)
         { PushDate = pushDate; Endpoint = endpoint; Prms = prms; Items = items; Skips = skips; ToSend = toSend; }
     }
@@ -737,6 +798,9 @@ VALUES (@d{k}, @n{k}, @u{k}, @o{k}, @r{k}, @ok{k}, @od{k}, @md{k}, @x{k}{(vars.C
                 _ => throw new InvalidOperationException($"{p.Name}: unknown SourceType {p.Type}")
             };
         }
+        // op_rdgdt is the date the opening reading was actually taken from (the file's reading date, or the opening date / fallback date that had a reading)
+        if (old.TryGetValue(ReadDate, out var openedOn) && openedOn != null && prms.FirstOrDefault(p => p.Name.Equals("op_rdgdt", StringComparison.OrdinalIgnoreCase)) is { } opParam)
+            v[opParam.Name] = DateTime.Parse(openedOn, Inv).ToString(opParam.Format ?? "dd/MM/yyyy", Inv);
 
         // the opening kWh reading is not a request parameter, but CALC rows can use it (e.g. consumed_units = closing_kwh - opening_kwh_reading)
         v["opening_kwh_reading"] = old.GetValueOrDefault(KwhColumn);
@@ -751,8 +815,11 @@ VALUES (@d{k}, @n{k}, @u{k}, @o{k}, @r{k}, @ok{k}, @od{k}, @md{k}, @x{k}{(vars.C
 
         // nil consumption (consumed_units from -1 to +1, so 0 too): status and billing_status are 09 instead of the normal 01
         if (v.TryGetValue("consumed_units", out var cu) && decimal.TryParse(cu, NumberStyles.Any, Inv, out var used) && used >= -1 && used <= 1)
+        {
             foreach (var n in new[] { "status", "billing_status" })
                 if (v.ContainsKey(n)) v[n] = NilConsumptionStatus;
+            if (used < 0) v["consumed_units"] = "0"; // closing a little below opening (e.g. a rounded opening reading): nil consumption, not a negative number
+        }
         return v;
     }
 

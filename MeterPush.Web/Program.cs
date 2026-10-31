@@ -15,6 +15,9 @@ var accessCode = builder.Configuration["AccessCode"] ?? "";
 builder.Services.AddHostedService(_ => new HourlyScheduler(connStr)); // automatic hourly push (switched on in the Hourly: Automatic tab)
 builder.Services.AddResponseCompression();   // gzip / brotli: the page (65 KB) and the JSON replies travel much smaller over a slow link
 var app = builder.Build();
+// the full list of meters (Excel/CSV with a 'service' column): the Monthly tab shows which of them were not sent
+var allMetersFile = builder.Configuration["AllMetersFile"] is { Length: > 0 } cfgList
+    ? cfgList : Path.GetFullPath(Path.Combine(app.Environment.ContentRootPath, "..", "All meter numbers.xlsx"));
 
 app.UseResponseCompression();
 app.UseDefaultFiles();
@@ -45,8 +48,32 @@ api.MapPost("/preview", (PreviewReq req) =>
 {
     if (!DateTime.TryParseExact(req.Date, "yyyy-MM-dd", null, System.Globalization.DateTimeStyles.None, out var date))
         return Results.BadRequest(new { error = "Push date must be yyyy-MM-dd." });
-    var job = Runner.StartPreview(connStr, date, req.Limit is > 0 ? req.Limit : null, req.IgnoreLog, req.Auto, out var error);
+    Runner.StoredOpening? opening = null;
+    if (!string.IsNullOrEmpty(req.OpeningId) && !Runner.Openings.TryGetValue(req.OpeningId, out opening))
+        return Results.BadRequest(new { error = "The opening-readings file is no longer loaded - choose it again (or clear it)." });
+    var job = Runner.StartPreview(connStr, date, req.Limit is > 0 ? req.Limit : null, req.IgnoreLog, req.Auto, opening, out var error);
     return job == null ? Results.Conflict(new { error }) : Results.Ok(new { jobId = job.Id });
+});
+
+// ---- opening readings from a file (.xlsx / .csv): kept in memory, then picked in Preview with its id
+api.MapPost("/opening/upload", async (HttpRequest req) =>
+{
+    if (!req.HasFormContentType) return Results.BadRequest(new { error = "Choose a file to upload." });
+    var form = await req.ReadFormAsync();
+    var file = form.Files.FirstOrDefault();
+    if (file == null || file.Length == 0) return Results.BadRequest(new { error = "Choose a file to upload." });
+    try
+    {
+        using var stream = file.OpenReadStream();
+        var res = OpeningFile.Read(file.FileName, stream);
+        if (res.Rows.Count == 0) return Results.BadRequest(new { error = "No usable opening readings in this file. " + string.Join(" ", res.Notes) });
+        foreach (var old in Runner.Openings.Where(o => o.Value.Created < DateTime.Now.AddHours(-6)).Select(o => o.Key).ToList()) Runner.Openings.TryRemove(old, out _);
+        var id = Guid.NewGuid().ToString("N")[..10];
+        Runner.Openings[id] = new Runner.StoredOpening(file.FileName, res.Rows, DateTime.Now);
+        return Results.Ok(new { id, name = file.FileName, rows = res.Total, usable = res.Rows.Count, notes = res.Notes });
+    }
+    catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
+    catch (System.Xml.XmlException) { return Results.BadRequest(new { error = "This does not look like a valid .xlsx file." }); }
 });
 
 // ---- send from an uploaded file (.xlsx / .csv): becomes a plan, then Check the preview -> Send as usual
@@ -139,6 +166,7 @@ api.MapGet("/plans/{id}", (string id) =>
         planId = sp.Id, pushDate = p.PushDate.ToString("yyyy-MM-dd"), endpoint = p.Endpoint, created = sp.Created, sent = sp.Sent,
         toSend = p.ToSend.Count, alreadySent = p.Items.Count(i => i.Done), skipped = p.FileName != null ? p.Skips.Count : p.NewSkips,
         limit = sp.Opts.Limit, ignoreLog = sp.Opts.IgnoreLog, quick = p.Quick, examined = p.Examined, fileName = p.FileName,
+        openingFile = p.OpeningFileName, openingFromFile = p.OpeningFromFile, openingMismatch = p.OpeningMismatch,
         skippedBreakdown = p.Skips.Where(s => p.FileName != null || !s.Done).GroupBy(s => SkipLabel(s.Why))
             .OrderByDescending(g => g.Count()).Select(g => new { reason = g.Key, count = g.Count() })
     });
@@ -552,6 +580,132 @@ ORDER BY l.PushDate, l.ServiceNo", db) { CommandTimeout = 300 })
     return Results.File(book, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", $"monthly_sent_{first:yyyy-MM}.xlsx");
 });
 
+
+// ------------------------------------------------------------ month summary: unique meters sent / not sent (Monthly Run tab)
+// "Sent" = the meter was accepted (Status OK) on any push date of the month. "Not sent" = a meter of the uploaded all-meters list
+// that was not accepted: skipped / failed on its latest attempt, or never attempted (no row in dbo.PushLog_Monthly for the month).
+
+// per meter (service number without spaces): the OK row if any, else the latest attempt
+static Dictionary<string, (string Status, string? Detail, DateTime PushDate)> MonthBest(SqlConnection db, DateTime first)
+{
+    var d = new Dictionary<string, (string, string?, DateTime)>(StringComparer.Ordinal);
+    using var cmd = new SqlCommand(@"
+SELECT ServiceNo, Status, Detail, PushDate FROM (
+  SELECT ServiceNo, Status, Detail, PushDate, ROW_NUMBER() OVER (PARTITION BY ServiceNo ORDER BY CASE WHEN Status='OK' THEN 0 ELSE 1 END, PushedOn DESC) rn
+  FROM dbo.PushLog_Monthly WHERE PushDate>=@from AND PushDate<@to) x WHERE rn=1", db) { CommandTimeout = 120 };
+    cmd.Parameters.AddWithValue("@from", first); cmd.Parameters.AddWithValue("@to", first.AddMonths(1));
+    using var r = cmd.ExecuteReader();
+    while (r.Read()) d[MeterList.Norm(r.GetString(0))] = (r.GetString(1), r.IsDBNull(2) ? null : r.GetString(2), r.GetDateTime(3));
+    return d;
+}
+
+static string NotSentReason((string Status, string? Detail, DateTime PushDate)? b) => b switch
+{
+    null => "Not attempted yet (no reading for the closing day, or not pushed)",
+    { Status: "SKIPPED" } x => SkipLabel(x.Detail ?? ""),
+    { Status: "FAILED" } => "Rejected or failed when sent",
+    _ => "Other"
+};
+
+// the all-meters file (path in appsettings.json "AllMetersFile"): read from disk, re-read automatically when the file changes
+static MeterList.Data? TryList(string path, out string? error)
+{
+    try { error = null; return MeterList.Load(path); }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or System.Xml.XmlException)
+    { error = ex is FileNotFoundException ? $"The all-meters file was not found: {path}" : $"The all-meters file could not be read ({path}): {ex.Message}"; return null; }
+}
+
+static bool ParseMonth(string date, out DateTime first)
+{
+    first = default;
+    if (!DateTime.TryParseExact(date, "yyyy-MM-dd", null, System.Globalization.DateTimeStyles.None, out var d)) return false;
+    first = new DateTime(d.Year, d.Month, 1);
+    return true;
+}
+
+api.MapGet("/monthly/summary", (string date) =>
+{
+    if (!ParseMonth(date, out var first)) return Results.BadRequest(new { error = "date must be yyyy-MM-dd" });
+    using var db = new SqlConnection(connStr); db.Open();
+    var best = MonthBest(db, first);
+    var unique = best.Values.Count(v => v.Status == "OK");
+    var list = TryList(allMetersFile, out var listError);
+    if (list == null) return Results.Ok(new { month = first.ToString("yyyy-MM"), unique, hasList = false, listError });
+    int sentInList = 0;
+    var reasons = new Dictionary<string, int>();
+    foreach (var m in list.Meters)
+    {
+        if (best.TryGetValue(MeterList.Norm(m.Service), out var b))
+        {
+            if (b.Status == "OK") { sentInList++; continue; }
+            var rs = NotSentReason(b); reasons[rs] = reasons.GetValueOrDefault(rs) + 1;
+        }
+        else { var rs = NotSentReason(null); reasons[rs] = reasons.GetValueOrDefault(rs) + 1; }
+    }
+    return Results.Ok(new
+    {
+        month = first.ToString("yyyy-MM"), unique, hasList = true, listName = list.Name, listTotal = list.Meters.Count,
+        sentInList, notSent = list.Meters.Count - sentInList,
+        reasons = reasons.OrderByDescending(x => x.Value).Select(x => new { reason = x.Key, count = x.Value })
+    });
+});
+
+
+// Excel of the meters in the list that were not sent in the month of ?date=, with the status, the reason and (when the meter got as far as being built)
+// the API values as they would have been sent (dbo.PushData_Monthly). Meters never attempted have the API columns blank.
+api.MapGet("/monthly/notsent/download", (string date) =>
+{
+    if (!ParseMonth(date, out var first)) return Results.BadRequest(new { error = "date must be yyyy-MM-dd" });
+    var list = TryList(allMetersFile, out var listError);
+    if (list == null) return Results.BadRequest(new { error = listError });
+    using var db = new SqlConnection(connStr); db.Open();
+    var best = MonthBest(db, first);
+
+    var dataCols = new List<string>();
+    using (var c = new SqlCommand(@"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='PushData_Monthly'
+  AND COLUMN_NAME NOT IN ('DataId','PushDate','ServiceNo','UniqueServiceNo','Outcome','Reply','PushedOn','RequestXml') ORDER BY ORDINAL_POSITION", db) { CommandTimeout = 120 })
+    using (var r = c.ExecuteReader()) while (r.Read()) dataCols.Add(r.GetString(0));
+
+    // the values built for the latest non-accepted attempt of each meter
+    var values = new Dictionary<string, string[]>(StringComparer.Ordinal);
+    if (dataCols.Count > 0)
+    {
+        using var c = new SqlCommand($@"
+WITH b AS (SELECT ServiceNo, PushDate, ROW_NUMBER() OVER (PARTITION BY ServiceNo ORDER BY PushedOn DESC) rn
+           FROM dbo.PushLog_Monthly WHERE PushDate>=@from AND PushDate<@to AND Status<>'OK')
+SELECT b.ServiceNo{string.Concat(dataCols.Select(n => ", d.[" + n.Replace("]", "]]") + "]"))}
+FROM b JOIN dbo.PushData_Monthly d ON d.PushDate=b.PushDate AND d.ServiceNo=b.ServiceNo WHERE b.rn=1", db) { CommandTimeout = 300 };
+        c.Parameters.AddWithValue("@from", first); c.Parameters.AddWithValue("@to", first.AddMonths(1));
+        using var r = c.ExecuteReader();
+        while (r.Read())
+        {
+            var row = new string[dataCols.Count];
+            for (int i = 0; i < row.Length; i++) row[i] = r.IsDBNull(i + 1) ? "" : Convert.ToString(r.GetValue(i + 1), System.Globalization.CultureInfo.InvariantCulture) ?? "";
+            values[MeterList.Norm(r.GetString(0))] = row;
+        }
+    }
+
+    var head = new List<string> { "dc", "service_no", "meter_no", "status", "reason", "detail", "last_push_date" };
+    head.AddRange(dataCols);
+    var rows = new List<string[]> { head.ToArray() };
+    var reasons = new Dictionary<string, int>();
+    foreach (var m in list.Meters.OrderBy(m => m.Dc, StringComparer.Ordinal).ThenBy(m => m.Service, StringComparer.Ordinal))
+    {
+        var key = MeterList.Norm(m.Service);
+        (string Status, string? Detail, DateTime PushDate)? b = best.TryGetValue(key, out var bb) ? bb : null;
+        if (b?.Status == "OK") continue;
+        var reason = NotSentReason(b);
+        reasons[reason] = reasons.GetValueOrDefault(reason) + 1;
+        var line = new List<string> { m.Dc, m.Service, m.MeterNo, b?.Status ?? "NOT ATTEMPTED", reason, b?.Detail ?? "", b?.PushDate.ToString("yyyy-MM-dd") ?? "" };
+        line.AddRange(values.TryGetValue(key, out var v) ? v : new string[dataCols.Count].Select(_ => ""));
+        rows.Add(line.ToArray());
+    }
+    var byReason = new List<string[]> { new[] { "reason", "meters" } };
+    byReason.AddRange(reasons.OrderByDescending(x => x.Value).Select(x => new[] { x.Key, x.Value.ToString() }));
+    var book = XlsxWriter.Build(new[] { ("Not sent", rows), ("By reason", byReason) });
+    return Results.File(book, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", $"monthly_not_sent_{first:yyyy-MM}.xlsx");
+});
+
 // ------------------------------------------------------------ history screen
 
 api.MapGet("/history/dates", () =>
@@ -714,7 +868,7 @@ static string ReplyMeaning(string reply)
     return "";
 }
 
-record PreviewReq(string Date, int? Limit, bool IgnoreLog, bool Auto = false);
+record PreviewReq(string Date, int? Limit, bool IgnoreLog, bool Auto = false, string? OpeningId = null);
 record HourlyPreviewReq(string Date, int Hour, int? Limit, bool IgnoreLog, bool Auto = false);
 record SendReq(int ConfirmCount);
 record SchedulerReq(bool Enabled);

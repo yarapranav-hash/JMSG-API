@@ -98,6 +98,8 @@ Open `http://<this PC's name or IP>:5080` from any PC on the network. The addres
 - **Run tab:** pick the push date (optionally "test with only N meters" and "also resend meters already sent"), press **Preview**. It reads the meter data (1 to 5 minutes) and shows how many records will be sent, how many are already sent and how many are skipped and why. A table lists every record (click a row to see all 39 values and the XML), another lists the skipped meters. Both can be downloaded as CSV. **Send to vendor API** asks for a confirmation and then sends exactly what the preview showed (several at a time, see Parallel sending), with a progress bar and a **Stop** button (the page shows only the accepted and failed counts, not a line per meter; failed meters are listed). A preview can be sent only once, so nothing is sent twice by accident.
 - **Quick test (test box filled in):** with a number in "test with only N meters" the page does not read every meter. It looks at the meters one by one, straight from their own modem tables (same selection rule as the procedure, same checks), until N are ready - seconds instead of minutes. The counts on the preview then cover only the meters it looked at (the page says so). Leave the box empty for the full run. Console: `--limit N` does the same; add `--full-read` to read every meter first, and `--verify-quick 25` compares the quick reader with the procedure (read-only).
 - **Send from a file (Run tab, "Or send from a file"):** upload an Excel (.xlsx, first sheet) or CSV file, one row per meter, first row = column names (same names as the setMonthly fields; **Download template** gives them). The values are sent as they are - nothing is read from the meter tables - after format checks only: required columns present and filled (ukscno, meter_no, date_time, rmd_kwh, closing_kwh, consumed_units, scno; rmd_kva and closing_kvah may be left empty and are then not sent), ukscno is 9 digits, no repeated ukscno in the file. Blank cells or missing columns for the other fields take the standard value from `PushConfig_Monthly` (status 01, billing_type kWh, bill_date = push date, ...); username/password always come from the settings. `meter_no` is sent in single quotes and `scno` without spaces automatically. Dates may be text in the usual format (14/10/2026 11:30:00 PM) or Excel dates. An optional `service_no` column (0216 00011) lets the page recognise meters already sent (otherwise it is matched through scno). The push date and the "also resend" tick above are used. An upload always shows the preview first (it ignores Automatic mode); sending, History and the `PushData_Monthly` record work as for a normal run.
+- **Opening readings from Excel (Run tab, optional):** choose an Excel/CSV file (columns `METER NO`, `CLOSING READING`, optional `Service No` and `Present month reading date`; other columns are ignored) before Preview. The file's closing reading is used as the **opening reading** of that meter, so `consumed_units` = closing reading of the last day of the previous month (from the DB) minus the file's reading. `op_rdgdt` is that meter's `Present month reading date` (`dd.MM.yyyy` text or an Excel date). Meters are matched on the meter number (the closing reading's `MSN`) and cross-checked on the service number; a meter that is not in the file, has no closing reading in it, appears twice in it, or has another service number keeps the normal opening reading (push date minus one month). The file is kept in memory only (nothing is stored in the database); the plan shows how many meters used it.
+- **Meters sent / not sent (Run tab):** three boxes show, for the month of the selected push date, the meters in the **all-meters list**, the **unique meters sent** (accepted on any push day of that month; a meter sent twice counts once) and the meters **not sent yet** (with the reasons: skipped for a check, rejected, or never attempted). The list is the Excel/CSV file named in `MeterPush.Webppsettings.json` (`AllMetersFile`, a `service` column and optionally `Meter No` and `DC`); it is read from that path, nothing is uploaded, and it is re-read automatically if the file changes. **Download sent (Excel)** has every accepted meter with all the API values sent; **Download not sent (Excel)** has the not-sent meters of the list with status, reason and the API values that were built for them (blank for meters that were never attempted, because nothing was read for them).
 - **History tab:** per push date, the counts of sent (OK), failed and skipped meters; a filterable list; click a row to see everything that was sent and the API's reply. **Retry failed** opens the Run tab for that date (failed meters are included automatically).
 - Only one preview or send runs at a time. A preview is kept for 3 hours.
 - It needs the same settings as the console app (`PushConfig`, `PushConfig_Monthly`, `PushData_Monthly`).
@@ -110,13 +112,14 @@ Open `http://<this PC's name or IP>:5080` from any PC on the network. The addres
 
 ### Step 2: Work out the two dates
 - **Push date** is today, or the `--date` value.
-- **Opening date** is the push date minus 1 month. For example, push date 2026-10-01 gives opening date 2026-09-01.
+- **Opening date** depends only on the month of the push date. For a push date in November (closing = 31 Oct) the opening reading is taken from **30 Sep**; a service with no reading that day uses **29 Sep**, then **1 Oct, 2 Oct, 3 Oct, 4 Oct, 5 Oct** (the first date that has a reading). The same dates apply to push dates 1 Nov, 2 Nov, ... 30 Nov. A service with no reading on any of them is skipped. (`OPENING_FORWARD_DAYS` is no longer used.)
+- **Closing date** is the last day of the month before the push date, whatever day of the month the push date is (push 2026-11-01, 11-02 or 11-03 all use 2026-10-31). A service with no reading that day takes the latest reading of the day before; `CLOSING_LOOKBACK_DAYS` (default 1, `dbo.PushConfig` GLOBAL) says how many earlier days are tried. A service with no closing reading on any of those days is not part of the run.
 
 ### Step 3: Read the meter readings (stored procedure)
-All the dates the run may need (push date, opening date plus `OPENING_FORWARD_DAYS` days after it, last day of the previous month plus `MD_LOOKBACK_DAYS` days before it) are requested **in parallel**, each call on its own connection, `PROC_PARALLELISM` (default 5) at a time. The console prints a line when each call starts and when it returns, with the number of services and the seconds it took. The older description of two calls below is the core of it.
+All the dates the run may need (push date, the seven opening dates above, last day of the previous month plus `MD_LOOKBACK_DAYS` days before it) are requested **in parallel**, each call on its own connection, `PROC_PARALLELISM` (default 5) at a time. The console prints a line when each call starts and when it returns, with the number of services and the seconds it took. The older description of two calls below is the core of it.
 
 The app calls `dbo.PrBLSTotalDCWiseMeterDataInstantDay @Date, @DC = NULL, @stmt = 'ALL'`:
-- Once for the push date. This is the **NEW** reading, used for the closing values, `meter_no`, `rmd_kva`, `rmd_kwh` and `date_time`.
+- Once for the closing date (last day of the previous month, then `CLOSING_LOOKBACK_DAYS` earlier days). This is the **NEW** reading, used for the closing values, `meter_no`, `rmd_kva`, `rmd_kwh` and `date_time`.
 - Once for the opening date. This is the **OLD** reading, used for the opening values.
 
 The procedure is the same one the existing UI uses. Each call takes roughly 20 to 40 seconds. What the procedure does:
@@ -144,9 +147,9 @@ The opening and closing kWh are read from the procedure only for checks 6 and 7.
 | 1 | Already logged OK for this push date | not sent again, and left out of the preview |
 | 2 | The service is not in `ServiceDetails` with `IsActive = 1` | `service not found (active) in ServiceDetails` |
 | 3 | `ServiceDetails.UniqueServiceNo` is not exactly 9 digits (or empty) | `no valid 9-digit UniqueServiceNo in ServiceDetails` |
-| 4 | The service has no reading on the opening date or (and, if `OPENING_FORWARD_DAYS` is above 0, on that many following days; it is 0 now, so only the opening date is checked) | `no reading for <opening date> (opening)` |
+| 4 | The service has no reading on the opening date (last day of the month before the closing month), the day before it, or the 1st to 5th of the closing month | `no reading for <opening date>, the day before, or <1st> to <5th> (opening)` |
 | 5 | A mapped value can't be built (missing column), or the opening/closing kWh is missing | the error message / `opening or closing kWh reading missing` |
-| 6 | Closing is lower than opening, for example a replaced meter | `closing < opening (consumed -x) - meter replaced/rolled over?` |
+| 6 | Closing is lower than opening by **more than 1 kWh**, for example a replaced meter (a difference from -1 to 0 is nil consumption, see below) | `closing < opening (consumed -x) - meter replaced/rolled over?` |
 | 7 | **The 120% rule:** (closing_kwh - opening_kwh) / opening_kwh x 100 is greater than `MONTHLY_MAX_INCREASE_PCT` | `increase x% > 120% (opening ..., closing ...)` |
 
 | 8 | `rmd_kva` or `rmd_kwh` is greater than `MONTHLY_MAX_MD` (default 6) | `rmd_kva 28592807.76 > 6` |
@@ -211,7 +214,7 @@ The API replies with HTTP 200 even when its own insert fails, so the app reads t
 | `meter_phase` | `CONST` `1` | |
 | `tariff_category` | `CONST` `1` | |
 | `date_time` | `PROC_NEW` `Date & Time` | Format `dd/MM/yyyy hh:mm:ss tt`, for example `01/10/2026 08:30:00 PM` |
-| `op_rdgdt` | push date minus 1 month | `dd/MM/yyyy` |
+| `op_rdgdt` | the date the opening reading was taken from | `dd/MM/yyyy`. Normally 30 Sep for a November push (or the fallback date that had a reading); with an opening-readings file, that meter's `Present month reading date`. |
 | `bill_date` | push date | `dd/MM/yyyy` |
 | `bill_processdt` | push date | `dd/MM/yyyy` |
 | `rmd_kva` | `PROC_PREVEND` `MD kVA` | From the last day of the month before the push date (push 2026-10-01 -> 2026-09-30), latest reading that day. `MD_LOOKBACK_DAYS` (now 1) says how many earlier days are searched when a meter has no reading that day (09-30, then 09-29). **A meter with no MD value after that is skipped** (`no rmd_kva/rmd_kwh reading on 2026-09-30 or the 1 day(s) before`). Left out if none is found. |
@@ -220,8 +223,8 @@ The API replies with HTTP 200 even when its own insert fails, so the app reads t
 | `billing_type` | `CONST` `kWh` | Not quoted |
 | `opening_kwh` | `CONST` `0` | Fixed `0`; the real opening reading is only used for the checks and `consumed_units` |
 | `opening_kvah` | `CONST` `0` | |
-| `closing_kwh` | `PROC_NEW` `Meter Reading(kWh)` | Reading on the push date |
-| `closing_kvah` | `PROC_NEW` `Meter Reading(kVAh)` | Reading on the push date |
+| `closing_kwh` | `PROC_NEW` `Meter Reading(kWh)` | Reading on the last day of the previous month (or the day before, if none) |
+| `closing_kvah` | `PROC_NEW` `Meter Reading(kVAh)` | Reading on the last day of the previous month (or the day before, if none) |
 | `status` | `CONST` `01` | |
 | `noof_months` | `CONST` `1` | |
 | `billing_status` | `CONST` `01` | |
@@ -266,11 +269,11 @@ DELETE FROM dbo.PushLog_Monthly WHERE PushDate = '2026-10-01' AND ServiceNo = '0
 - **`ukscno` is `ServiceDetails.UniqueServiceNo`.** Services without a valid 9-digit value are skipped. Some values are duplicated or junk (for example `123456789`), so check the preview.
 - **The 5,427 records pushed on 2026-10-01 used the old `ukscno` (service number without spaces) and the old field set.** They are marked OK in `PushLog_Monthly`, so a rerun skips them until their log rows are deleted.
 - **`rmd_kwh` is the procedure's `MD kW`**, because there is no MD kWh column.
-- **Opening is the reading one month before the push date, closing is the push-date reading**, but only the closing values are sent. The opening values are used for the skip checks.
+- **Opening is the reading one month before the push date, closing is the reading of the last day of the previous month (day before as fallback)**, but only the closing values are sent. The opening values are used for the skip checks.
 - **Only feeders 6, 11 and 19 are covered**, because the stored procedure filters on them.
 - **A service with no reading on the opening date can't be sent** (about 290 on 2026-10-01).
 - **"Record already updated" is logged as OK.** The app does not tell you whether that run changed anything on the server.
-- **Nil consumption = status 09:** when `consumed_units` is from -1 to +1 (0 included), the program sends `status` and `billing_status` as `09` instead of the configured `01` (`MonthlyPush.NilConsumptionStatus`, applied in `BuildValues` after `consumed_units` is calculated). The preview and the history show the status. Meters sent from an uploaded file keep the file's values. The other codes (02, 03, 05, 11, 99) are not produced by the program.
+- **Nil consumption = status 09:** when `consumed_units` is from -1 to +1 (0 included), the program sends `status` and `billing_status` as `09` instead of the configured `01` (`MonthlyPush.NilConsumptionStatus`, applied in `BuildValues` after `consumed_units` is calculated). A consumption between -1 and 0 (for example opening 6195 from the file, closing 6194.64) is sent as `0`, not as a negative number. The preview and the history show the status. Meters sent from an uploaded file keep the file's values. The other codes (02, 03, 05, 11, 99) are not produced by the program.
 - **The reading time varies.** `date_time` is the time of each meter's latest reading that day, so it is different for each meter.
 - **Credentials:** the SQL Server password is stored as plain text in `appsettings.json`, and the SOAP password is in `dbo.PushConfig`. Restrict access to both.
 

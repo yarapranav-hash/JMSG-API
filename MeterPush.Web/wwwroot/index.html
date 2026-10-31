@@ -102,8 +102,22 @@
         <div><label for="limit">Test with only this many meters (optional)</label><input type="number" id="limit" min="1" placeholder="all" style="width:130px"></div>
         <label class="check"><input type="checkbox" id="ignoreLog"> Also resend meters already sent this month</label>
         <button class="primary" id="btnPreview">Preview</button>
-        <button class="secondary" id="btnMonthXl" title="Every meter accepted in the push date's month, with all the values sent. Download again after each day's push: the new meters are in it.">Download meters sent this month (Excel)</button>
+        <button class="secondary" id="btnMonthXl" title="Every meter accepted in the push date's month, with all the values sent. Download again after each day's push: the new meters are in it.">Download sent (Excel)</button>
       </div>
+      <div class="stats" style="margin-top:12px">
+        <div class="stat"><b id="stMonthList">-</b><span>meters in the list</span></div>
+        <div class="stat ok"><b id="stMonthUnique">-</b><span id="stMonthLabel">unique meters sent this month</span></div>
+        <div class="stat warn"><b id="stMonthNot">-</b><span>not sent yet</span></div>
+      </div>
+      <div class="small muted" id="monthNotes" style="margin:6px 0 0"></div>
+      <div class="row" style="margin-top:8px">
+        <button class="secondary" id="btnNotSentXl" title="Meters of the list that were not accepted in the push date's month, with the reason and the values that were built for them.">Download not sent (Excel)</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <div><label for="openFile" title="Excel/CSV with METER NO, CLOSING READING and Present month reading date. The closing reading in the file is used as the opening reading of this push, and its date as op_rdgdt.">Opening readings from Excel (optional)</label><input type="file" id="openFile" accept=".xlsx,.csv"></div>
+        <button class="secondary hidden" id="openClear">Clear file</button>
+      </div>
+      <div class="muted small" id="openNote" style="margin:6px 0 0"></div>
       <p class="muted small" id="modeNote" style="margin:10px 0 0">Preview only reads the meter data and shows what would be sent. Nothing goes to the vendor until you press Send.</p>
       <p class="muted small" style="margin:6px 0 0">A meter that was accepted on <b>any day of the push date's month</b> is not sent again (it shows under "Already sent"). In a new month the list starts empty and every meter can be sent again.</p>
       <div id="runMsg"></div>
@@ -668,6 +682,35 @@ async function showRun(r) {
 // ---------- run: preview
 function firstOfMonth() { const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1).toLocaleDateString('sv-SE'); }
 $('date').value = firstOfMonth();
+// the month of the selected push date: meters in the all-meters list, unique meters sent (any push day of the month) and meters not sent yet
+async function refreshMonthSummary() {
+  const d = $('date').value;
+  const set = (list, sent, not, label, notes) => {
+    $('stMonthList').textContent = list; $('stMonthUnique').textContent = sent; $('stMonthNot').textContent = not;
+    $('stMonthLabel').textContent = label; $('monthNotes').innerHTML = notes;
+  };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) { set('-', '-', '-', 'unique meters sent this month', ''); return; }
+  try {
+    const r = await api('/monthly/summary?date=' + d);
+    const label = 'unique meters sent in ' + new Date(r.month + '-01T00:00:00').toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
+    if (!r.hasList) { set('-', Number(r.unique).toLocaleString(), '-', label, esc(r.listError || 'The all-meters file is not available.')); return; }
+    set(Number(r.listTotal).toLocaleString(), Number(r.unique).toLocaleString(), Number(r.notSent).toLocaleString(), label,
+      `List file: <b>${esc(r.listName)}</b>. ` + (r.notSent ? '<b>Not sent:</b> ' + r.reasons.map(x => `${esc(x.reason)} (${Number(x.count).toLocaleString()})`).join(' &middot; ') : 'Every meter of the list was sent.'));
+  } catch (e) { set('-', '-', '-', 'unique meters sent this month', ''); }
+}
+$('date').addEventListener('change', refreshMonthSummary);
+$('date').addEventListener('input', refreshMonthSummary);
+refreshMonthSummary();
+
+$('btnNotSentXl').onclick = async () => {
+  const date = $('date').value;
+  if (!date) { alert('Choose a push date first.'); return; }
+  const res = await api('/monthly/notsent/download?date=' + date, { raw: true });
+  if (!res.ok) { const e = await res.json().catch(() => ({})); alert(e.error || 'Download failed'); return; }
+  const blob = await res.blob(); const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = `monthly_not_sent_${date.slice(0, 7)}.xlsx`; a.click();
+};
+
 
 const isAuto = () => document.querySelector('input[name=mode]:checked').value === 'auto';
 function applyMode() {
@@ -686,7 +729,7 @@ $('btnPreview').onclick = async () => {
   showMsg('', ''); $('planCard').classList.add('hidden'); $('resultCard').classList.add('hidden');
   try {
     const r = await api('/preview', { method: 'POST', body: JSON.stringify({
-      date: $('date').value, limit: $('limit').value ? +$('limit').value : null, ignoreLog: $('ignoreLog').checked, auto: isAuto() }) });
+      date: $('date').value, openingId: openingId || null, limit: $('limit').value ? +$('limit').value : null, ignoreLog: $('ignoreLog').checked, auto: isAuto() }) });
     startPolling(r.jobId, isAuto() ? 'Reading the meter data, then sending...' : ($('limit').value ? 'Quick test - reading only the meters needed...' : 'Reading all the meter data (1 to 7 minutes)...'));
   } catch (e) { showMsg('bad', e.message); }
 };
@@ -735,6 +778,26 @@ $('btnUpload').onclick = async () => {
   $('btnUpload').disabled = false;
 };
 
+// ---------- opening readings from a file (optional): uploaded as soon as it is chosen, used by the next Preview
+let openingId = null;
+function clearOpening() { openingId = null; $('openFile').value = ''; $('openClear').classList.add('hidden'); $('openNote').innerHTML = ''; }
+$('openClear').onclick = clearOpening;
+$('openFile').onchange = async () => {
+  const f = $('openFile').files[0];
+  openingId = null; $('openClear').classList.add('hidden');
+  if (!f) { $('openNote').innerHTML = ''; return; }
+  const fd = new FormData(); fd.append('file', f);
+  $('openNote').textContent = 'Reading the file...';
+  try {
+    const res = await fetch('/api/opening/upload', { method: 'POST', headers: { 'X-Access-Code': code }, body: fd });
+    if (res.status === 401) { await askCode(true); return $('openFile').onchange(); }
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(d.error || ('Upload failed (' + res.status + ')'));
+    openingId = d.id; $('openClear').classList.remove('hidden');
+    $('openNote').innerHTML = `<b>${esc(d.name)}</b> loaded: used as the opening readings of the next Preview.<br>` + d.notes.map(esc).join('<br>');
+  } catch (e) { $('openFile').value = ''; $('openNote').innerHTML = `<span style="color:var(--bad,#c0392b)">${esc(e.message)}</span>`; }
+};
+
 let jobStart = 0;
 const elapsed = () => { const s = Math.floor((Date.now() - jobStart) / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
 
@@ -765,16 +828,19 @@ async function poll() {
 
   clearInterval(pollTimer); $('btnPreview').disabled = false; $('btnUpload').disabled = false;
   if (j.state === 'Failed') { showMsg('bad', 'Failed: ' + j.error); $('progressCard').classList.add('hidden'); return; }
-  if (isSend) showResult(j); else { $('progressCard').classList.add('hidden'); loadPlan(j.planId); }
+  if (isSend) { showResult(j); refreshMonthSummary(); } else { $('progressCard').classList.add('hidden'); loadPlan(j.planId); }
 }
 
 // ---------- run: plan
 async function loadPlan(id) {
   try { plan = await api('/plans/' + id); } catch (e) { showMsg('bad', e.message); return; }
   $('planCard').classList.remove('hidden');
-  $('planTitle').textContent = '- push date ' + plan.pushDate + (plan.fileName ? ` - file ${plan.fileName}` : '') + (plan.limit ? ` - test limit ${plan.limit}` : '') + (plan.ignoreLog ? ' - resending already sent meters' : '');
+  $('planTitle').textContent = '- push date ' + plan.pushDate + (plan.fileName ? ` - file ${plan.fileName}` : '') + (plan.limit ? ` - test limit ${plan.limit}` : '') + (plan.ignoreLog ? ' - resending already sent meters' : '') + (plan.openingFile ? ` - opening readings from ${plan.openingFile}` : '');
   $('stSend').textContent = plan.toSend; $('stDone').textContent = plan.alreadySent; $('stSkip').textContent = plan.skipped;
-  $('breakdown').innerHTML = (plan.quick
+  $('breakdown').innerHTML = (plan.openingFile
+    ? `<div class="muted small" style="margin-bottom:6px"><b>Opening readings from ${esc(plan.openingFile)}:</b> used for ${plan.openingFromFile} meter(s); the other meters use the normal opening reading (push date minus one month).`
+      + (plan.openingMismatch ? ` ${plan.openingMismatch} meter(s) have another service number in the file and were not matched.` : '') + '</div>' : '')
+    + (plan.quick
     ? `<div class="muted small" style="margin-bottom:6px"><b>Quick test:</b> only ${plan.examined} meter(s) were checked (until ${plan.limit} were ready), so the counts below are not for the whole day. Leave the test box empty for the full run.</div>` : '')
     + (plan.skippedBreakdown.length
     ? '<b>Why meters are skipped:</b> ' + plan.skippedBreakdown.map(b => `${esc(b.reason)} (${b.count})`).join(' &middot; ') : '');
