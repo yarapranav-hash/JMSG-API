@@ -270,7 +270,7 @@ DELETE FROM dbo.PushLog_Monthly WHERE PushDate = '2026-10-01' AND ServiceNo = '0
 - **Only feeders 6, 11 and 19 are covered**, because the stored procedure filters on them.
 - **A service with no reading on the opening date can't be sent** (about 290 on 2026-10-01).
 - **"Record already updated" is logged as OK.** The app does not tell you whether that run changed anything on the server.
-- **Not implemented:** a rule to change `status` to 9 when `consumed_units` is between -1 and +1. It was discussed but not added.
+- **Nil consumption = status 09:** when `consumed_units` is from -1 to +1 (0 included), the program sends `status` and `billing_status` as `09` instead of the configured `01` (`MonthlyPush.NilConsumptionStatus`, applied in `BuildValues` after `consumed_units` is calculated). The preview and the history show the status. Meters sent from an uploaded file keep the file's values. The other codes (02, 03, 05, 11, 99) are not produced by the program.
 - **The reading time varies.** `date_time` is the time of each meter's latest reading that day, so it is different for each meter.
 - **Credentials:** the SQL Server password is stored as plain text in `appsettings.json`, and the SOAP password is in `dbo.PushConfig`. Restrict access to both.
 

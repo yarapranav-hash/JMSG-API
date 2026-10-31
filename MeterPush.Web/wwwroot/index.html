@@ -102,6 +102,7 @@
         <div><label for="limit">Test with only this many meters (optional)</label><input type="number" id="limit" min="1" placeholder="all" style="width:130px"></div>
         <label class="check"><input type="checkbox" id="ignoreLog"> Also resend meters already sent this month</label>
         <button class="primary" id="btnPreview">Preview</button>
+        <button class="secondary" id="btnMonthXl" title="Every meter accepted in the push date's month, with all the values sent. Download again after each day's push: the new meters are in it.">Download meters sent this month (Excel)</button>
       </div>
       <p class="muted small" id="modeNote" style="margin:10px 0 0">Preview only reads the meter data and shows what would be sent. Nothing goes to the vendor until you press Send.</p>
       <p class="muted small" style="margin:6px 0 0">A meter that was accepted on <b>any day of the push date's month</b> is not sent again (it shows under "Already sent"). In a new month the list starts empty and every meter can be sent again.</p>
@@ -168,6 +169,7 @@
           <select id="hStatus"><option value="">All</option><option value="OK">Sent (OK)</option><option value="FAILED">Failed</option><option value="SKIPPED">Skipped</option></select></div>
         <div><label for="hSearch">Search</label><input type="text" id="hSearch" placeholder="service, unique no, meter, reply" style="width:260px"></div>
         <button class="primary" id="hGo">Show</button>
+        <button class="secondary" id="hMonthXl" title="Every meter accepted in the month of the selected push date, with all the values sent">Download meters sent this month (Excel)</button>
         <button class="secondary hidden" id="hRetry">Retry failed &rarr; open in Run</button>
       </div>
       <div class="stats" id="hStats" style="margin-top:14px"></div>
@@ -543,6 +545,17 @@ async function downloadHSent(date, hour, status, q) {
   const blob = await res.blob(); const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = `hourly_${status === 'FAILED' ? 'failed' : status === 'OK' ? 'accepted' : 'sent'}_${date}_${String(hour).padStart(2, '0')}.xlsx`; a.click();
 }
+// Monthly: Excel of all meters accepted in the month of the given date (yyyy-MM-dd), with the values sent; built from the DB each time
+async function downloadMonthSent(date) {
+  if (!date) { alert('Choose a push date first.'); return; }
+  const month = date.slice(0, 7);
+  const res = await api('/history/month/download?month=' + month, { raw: true });
+  if (!res.ok) { const e = await res.json().catch(() => ({})); alert(e.error || 'Download failed'); return; }
+  const blob = await res.blob(); const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = `monthly_sent_${month}.xlsx`; a.click();
+}
+$('btnMonthXl').onclick = () => downloadMonthSent($('date').value);
+$('hMonthXl').onclick = () => downloadMonthSent($('hDate').value);
 $('hhDlF').onclick = () => { const v = $('hhSlot').value; if (!v) return; const [date, hour] = v.split('|'); downloadHSent(date, +hour, 'FAILED', ''); };
 $('hhDl').onclick = () => { const v = $('hhSlot').value; if (!v) return; const [date, hour] = v.split('|'); downloadHSent(date, +hour, $('hhStatus').value, $('hhSearch').value); };
 $('hhSearch').onkeydown = e => { if (e.key === 'Enter') loadHHistory(); };
@@ -785,8 +798,8 @@ async function loadRows() {
   const d = await api(`/plans/${plan.planId}/${view === 'skip' ? 'skipped' : 'records'}?skip=${page * PAGE}&take=${PAGE}&q=${q}${view === 'done' ? '&which=done' : ''}`);
   const t = $('planTable');
   if (view !== 'skip') {
-    t.innerHTML = '<tr><th>Service no</th><th>Unique no (ukscno)</th><th>Meter</th><th>Reading time</th><th>Closing kWh</th><th>Consumed</th><th>MD kVA</th><th>MD kW</th><th></th></tr>' +
-      d.rows.map(r => `<tr class="click" data-s="${esc(r.serviceNo)}"><td>${esc(r.serviceNo)}</td><td>${esc(r.ukscno)}</td><td>${esc(r.meterNo)}</td><td>${esc(r.dateTime)}</td><td>${esc(r.closingKwh)}</td><td>${esc(r.consumedUnits)}</td><td>${esc(r.rmdKva)}</td><td>${esc(r.rmdKwh)}</td><td>${r.alreadySent ? '<span class="pill OK">sent before</span>' : ''}</td></tr>`).join('');
+    t.innerHTML = '<tr><th>Service no</th><th>Unique no (ukscno)</th><th>Meter</th><th>Reading time</th><th>Closing kWh</th><th>Consumed</th><th>Status</th><th>MD kVA</th><th>MD kW</th><th></th></tr>' +
+      d.rows.map(r => `<tr class="click" data-s="${esc(r.serviceNo)}"><td>${esc(r.serviceNo)}</td><td>${esc(r.ukscno)}</td><td>${esc(r.meterNo)}</td><td>${esc(r.dateTime)}</td><td>${esc(r.closingKwh)}</td><td>${esc(r.consumedUnits)}</td><td>${esc(r.status)}</td><td>${esc(r.rmdKva)}</td><td>${esc(r.rmdKwh)}</td><td>${r.alreadySent ? '<span class="pill OK">sent before</span>' : ''}</td></tr>`).join('');
     t.querySelectorAll('tr.click').forEach(tr => tr.onclick = () => showPlanDetail(tr.dataset.s));
   } else {
     t.innerHTML = '<tr><th>Service no</th><th>Unique no</th><th>Why skipped</th><th>Details</th></tr>' +
@@ -875,8 +888,8 @@ async function loadHistory() {
   $('hStats').innerHTML =
     `<div class="stat ok"><b>${c.OK || 0}</b><span>sent (OK)</span></div><div class="stat bad"><b>${c.FAILED || 0}</b><span>failed</span></div><div class="stat warn"><b>${c.SKIPPED || 0}</b><span>skipped</span></div>`;
   $('hRetry').classList.toggle('hidden', !(c.FAILED > 0));
-  $('hTable').innerHTML = '<tr><th>Service no</th><th>Unique no</th><th>Meter</th><th>Outcome</th><th>Meaning</th><th>API reply / reason</th><th>Closing kWh</th><th>Consumed</th><th>When</th></tr>' +
-    d.rows.map(r => `<tr class="click" data-s="${esc(r.serviceNo)}"><td>${esc(r.serviceNo)}</td><td>${esc(r.ukscno)}</td><td>${esc(r.meterNo)}</td><td><span class="pill ${r.status}">${esc(r.status)}</span></td><td>${esc(r.meaning)}</td><td class="wrap muted">${esc(r.reply)}</td><td>${esc(r.closingKwh)}</td><td>${esc(r.consumedUnits)}</td><td>${esc((r.pushedOn || '').replace('T', ' ').slice(0, 19))}</td></tr>`).join('');
+  $('hTable').innerHTML = '<tr><th>Service no</th><th>Unique no</th><th>Meter</th><th>Outcome</th><th>Meaning</th><th>API reply / reason</th><th>Closing kWh</th><th>Consumed</th><th>Status sent</th><th>When</th></tr>' +
+    d.rows.map(r => `<tr class="click" data-s="${esc(r.serviceNo)}"><td>${esc(r.serviceNo)}</td><td>${esc(r.ukscno)}</td><td>${esc(r.meterNo)}</td><td><span class="pill ${r.status}">${esc(r.status)}</span></td><td>${esc(r.meaning)}</td><td class="wrap muted">${esc(r.reply)}</td><td>${esc(r.closingKwh)}</td><td>${esc(r.consumedUnits)}</td><td>${esc(r.sentStatus)}</td><td>${esc((r.pushedOn || '').replace('T', ' ').slice(0, 19))}</td></tr>`).join('');
   $('hTable').querySelectorAll('tr.click').forEach(tr => tr.onclick = () => showHistDetail(tr.dataset.s));
   $('hNote').textContent = `Showing the latest ${d.rows.length} row(s) (max 300). Pushes made before the values were stored have no detail.`;
 }

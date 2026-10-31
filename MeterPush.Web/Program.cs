@@ -157,7 +157,7 @@ api.MapGet("/plans/{id}/records", (string id, int? skip, int? take, string? q, s
         {
             serviceNo = i.ServiceNo, ukscno = V(i, "ukscno"), meterNo = V(i, "meter_no"), scno = V(i, "scno"), dateTime = V(i, "date_time"),
             rmdKva = V(i, "rmd_kva"), rmdKwh = V(i, "rmd_kwh"), closingKwh = V(i, "closing_kwh"), closingKvah = V(i, "closing_kvah"),
-            consumedUnits = V(i, "consumed_units"), alreadySent = i.Done
+            consumedUnits = V(i, "consumed_units"), status = V(i, "status"), alreadySent = i.Done
         })
     });
 });
@@ -497,6 +497,61 @@ ORDER BY ReadAt, ServiceNo", db);
     return Results.File(book, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", $"hourly_sent_{d:yyyy-MM-dd}_{hour:00}.xlsx");
 });
 
+// Excel of every meter the vendor accepted in one calendar month, with all the values that were sent (dbo.PushData_Monthly).
+// It is built from the database each time, so after each day's push the new meters are in the list (the list of the month grows).
+// A meter that was accepted more than once in the month (resend) appears once, with its latest push.
+api.MapGet("/history/month/download", (string month) =>
+{
+    if (!DateTime.TryParseExact(month, "yyyy-MM", null, System.Globalization.DateTimeStyles.None, out var first))
+        return Results.BadRequest(new { error = "month must be yyyy-MM" });
+    var to = first.AddMonths(1);
+    using var db = new SqlConnection(connStr); db.Open();
+
+    var dataCols = new List<string>();   // the parameter columns of PushData_Monthly (absent if sql\04 was never run)
+    using (var c = new SqlCommand(@"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='PushData_Monthly'
+  AND COLUMN_NAME NOT IN ('DataId','PushDate','ServiceNo','UniqueServiceNo','Outcome','Reply','PushedOn','RequestXml') ORDER BY ORDINAL_POSITION", db) { CommandTimeout = 120 })
+    using (var r = c.ExecuteReader()) while (r.Read()) dataCols.Add(r.GetString(0));
+    var hasData = dataCols.Count > 0;
+
+    var head = new List<string> { "service_no", "unique_service_no", "push_date", "sent_on", "api_reply" };
+    if (hasData) head.AddRange(dataCols);
+    var rows = new List<string[]> { head.ToArray() };
+    var select = "l.ServiceNo, l.UniqueServiceNo, l.PushDate, l.PushedOn, l.Detail" + string.Concat(dataCols.Select(n => ", d.[" + n.Replace("]", "]]") + "]"));
+    using (var c = new SqlCommand($@"
+WITH ok AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY ServiceNo ORDER BY PushedOn DESC) AS rn
+            FROM dbo.PushLog_Monthly WHERE PushDate>=@from AND PushDate<@to AND Status='OK')
+SELECT {select}
+FROM ok l
+{(hasData ? "LEFT JOIN dbo.PushData_Monthly d ON d.PushDate=l.PushDate AND d.ServiceNo=l.ServiceNo" : "")}
+WHERE l.rn=1
+ORDER BY l.PushDate, l.ServiceNo", db) { CommandTimeout = 300 })
+    {
+        c.Parameters.AddWithValue("@from", first); c.Parameters.AddWithValue("@to", to);
+        using var r = c.ExecuteReader();
+        while (r.Read())
+        {
+            var row = new string[r.FieldCount];
+            for (int i = 0; i < row.Length; i++)
+                row[i] = r.IsDBNull(i) ? "" : r.GetValue(i) switch
+                {
+                    DateTime t => t.TimeOfDay == TimeSpan.Zero ? t.ToString("yyyy-MM-dd") : t.ToString("yyyy-MM-dd HH:mm:ss"),
+                    var v => Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture) ?? ""
+                };
+            rows.Add(row);
+        }
+    }
+
+    var perDay = new List<string[]> { new[] { "push_date", "meters_accepted" } };
+    using (var c = new SqlCommand("SELECT PushDate, COUNT(DISTINCT ServiceNo) FROM dbo.PushLog_Monthly WHERE PushDate>=@from AND PushDate<@to AND Status='OK' GROUP BY PushDate ORDER BY PushDate", db) { CommandTimeout = 120 })
+    {
+        c.Parameters.AddWithValue("@from", first); c.Parameters.AddWithValue("@to", to);
+        using var r = c.ExecuteReader();
+        while (r.Read()) perDay.Add(new[] { r.GetDateTime(0).ToString("yyyy-MM-dd"), r.GetInt32(1).ToString() });
+    }
+    var book = XlsxWriter.Build(new[] { ("Sent this month", rows), ("Per day", perDay) });
+    return Results.File(book, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", $"monthly_sent_{first:yyyy-MM}.xlsx");
+});
+
 // ------------------------------------------------------------ history screen
 
 api.MapGet("/history/dates", () =>
@@ -527,7 +582,7 @@ api.MapGet("/history", (string date, string? status, string? q, int? take) =>
     using (var c = new SqlCommand(@"
 SELECT TOP (@take) l.ServiceNo, l.UniqueServiceNo, l.Status, l.Detail, l.PushedOn,
        d.meter_no, d.closing_kwh, d.consumed_units, d.rmd_kva, d.scno,
-       CASE WHEN d.DataId IS NULL THEN 0 ELSE 1 END AS hasData
+       CASE WHEN d.DataId IS NULL THEN 0 ELSE 1 END AS hasData, d.status
 FROM dbo.PushLog_Monthly l
 LEFT JOIN dbo.PushData_Monthly d ON d.PushDate = l.PushDate AND d.ServiceNo = l.ServiceNo
 WHERE l.PushDate = @d
@@ -550,7 +605,8 @@ ORDER BY l.PushedOn DESC, l.ServiceNo", db))
                 meaning = r.GetString(2) == "SKIPPED" ? SkipLabel(detail) : ReplyMeaning(detail), pushedOn = r.GetDateTime(4),
                 meterNo = r.IsDBNull(5) ? null : r.GetString(5), closingKwh = r.IsDBNull(6) ? null : r.GetString(6),
                 consumedUnits = r.IsDBNull(7) ? null : r.GetString(7), rmdKva = r.IsDBNull(8) ? null : r.GetString(8),
-                scno = r.IsDBNull(9) ? null : r.GetString(9), hasData = r.GetInt32(10) == 1
+                scno = r.IsDBNull(9) ? null : r.GetString(9), hasData = r.GetInt32(10) == 1,
+                sentStatus = r.IsDBNull(11) ? null : r.GetString(11)   // the status code that was sent (01, 09 ...)
             });
         }
     }

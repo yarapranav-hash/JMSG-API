@@ -748,8 +748,15 @@ VALUES (@d{k}, @n{k}, @u{k}, @o{k}, @r{k}, @ok{k}, @od{k}, @md{k}, @x{k}{(vars.C
             decimal a = Num(v, m.Groups[1].Value, p.Name), b = Num(v, m.Groups[2].Value, p.Name);
             v[p.Name] = Math.Round(a - b, 2).ToString("0.##", Inv);
         }
+
+        // nil consumption (consumed_units from -1 to +1, so 0 too): status and billing_status are 09 instead of the normal 01
+        if (v.TryGetValue("consumed_units", out var cu) && decimal.TryParse(cu, NumberStyles.Any, Inv, out var used) && used >= -1 && used <= 1)
+            foreach (var n in new[] { "status", "billing_status" })
+                if (v.ContainsKey(n)) v[n] = NilConsumptionStatus;
         return v;
     }
+
+    internal const string NilConsumptionStatus = "09";
 
     // Quote=1 params are sent in single quotes ('A08767'); applied last so calculations and checks see the plain value.
     internal static string? Quoted(Param p, string? value) =>
